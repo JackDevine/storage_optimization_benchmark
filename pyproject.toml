@@ -1,0 +1,11 @@
+[project]
+name = "storage-optimization-benchmark"
+version = "0.1.0"
+description = "Benchmark data and models for storage optimization against AEMO NEM market data"
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb>=1.5.6",
+    "nemosis>=3.8.1",
+    "pandas>=2.2.3",
+    "pyarrow>=22.0.0",
+]
