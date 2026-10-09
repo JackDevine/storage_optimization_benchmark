@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Battery Agent Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface-1: #fcfcfb;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --series-3: #1baf7a;
+    --good: #0ca30c;
+    --critical: #d03b3b;
+    --warning: #fab219;
+    --wash: rgba(42, 120, 214, 0.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface-1: #1a1a19;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --border: rgba(255, 255, 255, 0.10);
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --wash: rgba(57, 135, 229, 0.12);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --wash: rgba(57, 135, 229, 0.12);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1440px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  h2 { font-size: 14px; margin: 0 0 8px; font-weight: 600; }
+  .muted { color: var(--text-muted); }
+  .secondary { color: var(--text-secondary); }
+  .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  header.row { justify-content: space-between; margin-bottom: 12px; }
+  label { color: var(--text-secondary); font-size: 13px; display: inline-flex; gap: 6px; align-items: center; }
+  select, button, input[type=checkbox] { font: inherit; color: var(--text-primary); }
+  select, button {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; min-height: 30px;
+  }
+  button { cursor: pointer; }
+  button:hover { background: var(--wash); }
+  button:focus-visible, select:focus-visible { outline: 2px solid var(--series-1); outline-offset: 1px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 12px; }
+  .tile .label { color: var(--text-secondary); font-size: 12px; }
+  .tile .value { font-size: 20px; font-weight: 600; margin-top: 2px; }
+  .tile .sub { color: var(--text-muted); font-size: 12px; }
+  .controls { margin-bottom: 10px; }
+  .controls .time { font-variant-numeric: tabular-nums; font-weight: 600; min-width: 190px; text-align: center; }
+  .controls input[type=range] { flex: 1; min-width: 160px; accent-color: var(--series-1); }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 12px; }
+  @media (max-width: 1000px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+  #chart { width: 100%; height: 640px; }
+  #bidchart { width: 100%; height: 220px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 3px 6px; text-align: right; border-bottom: 1px solid var(--grid); }
+  th { color: var(--text-secondary); font-weight: 500; }
+  td.eff { font-weight: 600; }
+  .pill { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; border-radius: 999px; padding: 1px 8px; border: 1px solid var(--border); }
+  .pill.good::before, .pill.bad::before, .pill.wait::before { content: ""; width: 8px; height: 8px; border-radius: 50%; }
+  .pill.good::before { background: var(--good); }
+  .pill.bad::before { background: var(--critical); }
+  .pill.wait::before { background: var(--warning); }
+  .subs { display: grid; gap: 8px; }
+  .sub-card { cursor: pointer; text-align: left; width: 100%; padding: 8px 10px; }
+  .sub-card[aria-pressed="true"] { border-color: var(--series-1); box-shadow: inset 0 0 0 1px var(--series-1); }
+  .detail h3 { font-size: 13px; margin: 12px 0 4px; color: var(--text-secondary); font-weight: 600; }
+  .detail p { margin: 0; white-space: pre-wrap; }
+  pre { background: var(--page); border: 1px solid var(--border); border-radius: 6px; padding: 10px; overflow: auto; max-height: 480px; font-size: 12px; }
+  details summary { cursor: pointer; color: var(--text-secondary); margin: 10px 0 4px; }
+  .feed { max-height: 420px; overflow: auto; display: grid; gap: 6px; }
+  .entry { border-left: 2px solid var(--grid); padding: 2px 8px; white-space: pre-wrap; word-break: break-word; }
+  .entry .meta { color: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .entry.thinking { border-color: var(--text-muted); color: var(--text-secondary); }
+  .entry.submission, .entry.result { border-color: var(--series-1); }
+  .entry.pause, .entry.limit_reached, .entry.session_error { border-color: var(--warning); }
+  .bottom { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; margin-top: 12px; }
+  @media (max-width: 1000px) { .bottom { grid-template-columns: minmax(0, 1fr); } }
+  .error { color: var(--critical); }
+  .stale { opacity: 0.55; transition: opacity 0.15s; }
+</style>
+</head>
+<body>
+<main>
+  <header class="row">
+    <h1>Battery agent dashboard</h1>
+    <div class="row">
+      <label>Run <select id="run"><option value="">(none)</option></select></label>
+      <label>Region <select id="region"></select></label>
+      <label>Submission <select id="submission"><option value="">(none yet)</option></select></label>
+    </div>
+  </header>
+
+  <section class="tiles" id="tiles" aria-label="Run statistics"></section>
+
+  <section class="card controls row" aria-label="Time controls">
+    <button data-step="-1440" aria-label="Back 1 day">◀◀ 1d</button>
+    <button data-step="-60" aria-label="Back 1 hour">◀ 1h</button>
+    <button data-step="-5" aria-label="Back 5 minutes">◀ 5m</button>
+    <span class="time" id="tau-label" aria-live="polite"></span>
+    <button data-step="5" aria-label="Forward 5 minutes">5m ▶</button>
+    <button data-step="60" aria-label="Forward 1 hour">1h ▶</button>
+    <button data-step="1440" aria-label="Forward 1 day">1d ▶▶</button>
+    <button id="play" aria-label="Play">Play</button>
+    <input type="range" id="slider" min="0" step="1" aria-label="Scrub time">
+    <label><input type="checkbox" id="clip" checked> Clip price spikes</label>
+    <label>Episode <select id="episode"><option value="">jump to…</option></select></label>
+    <span class="muted" style="font-size:12px">← → 5 min · Shift 1 h</span>
+  </section>
+
+  <div class="layout">
+    <section class="card">
+      <div id="chart" role="img" aria-label="Prices, state of charge and dispatch over time"></div>
+      <div class="muted" id="chart-note" style="font-size:12px"></div>
+    </section>
+    <aside class="card" aria-label="Bid for the next interval">
+      <h2>Bid for the next interval</h2>
+      <div id="bid-summary" class="secondary">Select a submission to see its bids.</div>
+      <div id="bidchart"></div>
+      <div id="bid-table"></div>
+    </aside>
+  </div>
+
+  <section class="card" style="margin-top:12px" aria-label="Score over the run">
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">Holdout episode score over the run</h2>
+      <div class="row">
+        <label>Against
+          <select id="progress-x">
+            <option value="wall_s">Wall time</option>
+            <option value="active_s">Active model time</option>
+            <option value="cost_usd">API-equivalent cost</option>
+            <option value="output_tokens">Output tokens</option>
+            <option value="total_tokens">Total tokens</option>
+          </select>
+        </label>
+        <label>Score
+          <select id="progress-y">
+            <option value="net_revenue">Net revenue ($)</option>
+            <option value="pct">% of perfect foresight</option>
+          </select>
+        </label>
+      </div>
+    </div>
+    <div id="progress" style="width:100%;height:300px"></div>
+    <div class="muted" id="progress-note" style="font-size:12px"></div>
+  </section>
+
+  <div class="bottom">
+    <section class="card">
+      <h2>Submissions</h2>
+      <div class="subs" id="subs"><span class="muted">No submissions yet.</span></div>
+      <div class="detail" id="detail"></div>
+    </section>
+    <section class="card">
+      <h2>Agent activity</h2>
+      <div class="feed" id="feed"><span class="muted">Select a run.</span></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const STEP_MS = 5 * 60 * 1000;
+const state = { meta: null, tauMs: 0, startMs: 0, endMs: 0, run: "", region: "SA1", sub: "", status: null, playing: null, inflight: false, pending: false };
+
+// Timestamps are AEMO market time (UTC+10) with no zone. Do arithmetic in UTC ms,
+// and hand Plotly naive strings so it never shifts them into the browser's zone.
+const parseT = (s) => Date.parse(s + "Z");
+const plotT = (ms) => new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+const fmtT = (ms) => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+const isoT = (ms) => new Date(ms).toISOString().slice(0, 19);
+const money = (v) => v == null ? "–" : (v < 0 ? "-$" : "$") + Math.abs(v).toLocaleString(undefined, { maximumFractionDigits: 0 });
+const pct = (v) => v == null ? "–" : v.toFixed(1) + "%";
+const mins = (s) => s == null ? "–" : s >= 3600 ? `${Math.floor(s / 3600)}h ${String(Math.round(s % 3600 / 60)).padStart(2, "0")}m` : `${Math.round(s / 60)}m`;
+const compact = (n) => n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v; else if (k.startsWith("on")) node.addEventListener(k.slice(2), v); else node.setAttribute(k, v);
+  }
+  for (const c of children) node.append(c instanceof Node ? c : document.createTextNode(c ?? ""));
+  return node;
+}
+
+async function api(path) {
+  const r = await fetch(path);
+  const body = await r.json();
+  if (body && body.error) throw new Error(body.error);
+  return body;
+}
+
+// ---------- chart ----------
+
+function axisStyle(extra = {}) {
+  return {
+    gridcolor: css("--grid"), linecolor: css("--axis"), zerolinecolor: css("--axis"),
+    tickfont: { color: css("--text-muted"), size: 11 }, titlefont: { color: css("--text-secondary"), size: 12 }, ...extra,
+  };
+}
+
+function priceRange(values) {
+  const v = values.filter((x) => x != null).sort((a, b) => a - b);
+  if (!v.length) return undefined;
+  const q = (p) => v[Math.min(v.length - 1, Math.floor(p * v.length))];
+  return [Math.min(-50, q(0.02) * 1.2), Math.max(200, q(0.98) * 1.3)];
+}
+
+function drawChart(market, disp) {
+  const tau = state.tauMs;
+  const x0 = plotT(tau - 12 * 3600e3), x1 = plotT(tau + 30 * 3600e3);
+  const traces = [
+    // keep every panel's axis drawn even before it has data
+    { x: [x0], y: [null], yaxis: "y2", showlegend: false, hoverinfo: "skip" },
+    { x: [x0], y: [null], yaxis: "y3", showlegend: false, hoverinfo: "skip" },
+  ];
+  // Colour follows the entity across all panels: actual price = neutral ink, forecasts = orange / aqua,
+  // the agent = blue, perfect foresight = muted grey reference.
+  traces.push({ name: "Actual price", x: market.actual.t, y: market.actual.rrp, type: "scatter", mode: "lines",
+    line: { color: css("--text-primary"), width: 2, shape: "hv" }, yaxis: "y", hovertemplate: "$%{y:,.0f}/MWh" });
+  if (market.p5min) traces.push({ name: "P5MIN forecast", x: market.p5min.t, y: market.p5min.rrp, mode: "lines",
+    line: { color: css("--series-2"), width: 2, dash: "dot", shape: "hv" }, yaxis: "y", hovertemplate: "$%{y:,.0f}/MWh" });
+  if (market.predispatch) traces.push({ name: "Predispatch forecast", x: market.predispatch.t, y: market.predispatch.rrp, mode: "lines",
+    line: { color: css("--series-3"), width: 2, dash: "dash", shape: "vh" }, yaxis: "y", hovertemplate: "$%{y:,.0f}/MWh" });
+
+  traces.push({ name: "Perfect foresight SOC", x: market.perfect_foresight.t, y: market.perfect_foresight.soc, mode: "lines",
+    line: { color: css("--text-muted"), width: 2 }, yaxis: "y2", hovertemplate: "%{y:.2f} MWh" });
+  if (disp && disp.available) {
+    const t = disp.t;
+    traces.push({ name: "Agent SOC", x: t, y: disp.soc, mode: "lines", line: { color: css("--series-1"), width: 2 }, yaxis: "y2", hovertemplate: "%{y:.2f} MWh" });
+    traces.push({ name: "Agent dispatch", x: t, y: disp.mw, type: "bar", marker: { color: css("--series-1") }, yaxis: "y3",
+      hovertemplate: "%{y:.2f} MW", width: STEP_MS * 0.85 });
+    const badX = [], badY = [], badText = [];
+    t.forEach((x, i) => {
+      if (disp.rejected[i] || disp.nonconforming[i] || disp.wrong_ramp[i]) {
+        badX.push(x); badY.push(0);
+        badText.push(disp.rejected[i] ? "Rejected bid" : disp.nonconforming[i] ? "Non-conformance" : "Wrong ramp rate in bid");
+      }
+    });
+    if (badX.length) traces.push({ name: "Rejected / non-conforming", x: badX, y: badY, mode: "markers", yaxis: "y3", text: badText,
+      marker: { color: css("--critical"), size: 9, symbol: "x" }, hovertemplate: "%{text}" });
+  }
+
+  const priceVals = traces.filter((t) => t.yaxis === "y").flatMap((t) => t.y);
+  const layout = {
+    paper_bgcolor: css("--surface-1"), plot_bgcolor: css("--surface-1"), font: { color: css("--text-primary"), family: "system-ui, sans-serif" },
+    margin: { l: 64, r: 16, t: 8, b: 36 }, hovermode: "x unified", bargap: 0,
+    hoverlabel: { bgcolor: css("--surface-1"), bordercolor: css("--axis"), font: { color: css("--text-primary") } },
+    legend: { orientation: "h", y: -0.06, font: { color: css("--text-secondary"), size: 12 } },
+    xaxis: axisStyle({ range: [x0, x1], type: "date", anchor: "y3" }),
+    yaxis: axisStyle({ domain: [0.46, 1], title: { text: "Price ($/MWh)" }, range: $("clip").checked ? priceRange(priceVals) : undefined, autorange: !$("clip").checked }),
+    yaxis2: axisStyle({ domain: [0.2, 0.42], title: { text: "Stored (MWh)" }, range: [0, 2] }),
+    yaxis3: axisStyle({ domain: [0, 0.16], title: { text: "MW" }, range: [-1.1, 1.1] }),
+    shapes: [
+      ...state.meta.episodes.map(([a, b]) => ({ type: "rect", xref: "x", yref: "paper", x0: a.replace("T", " "), x1: b.replace("T", " "),
+        y0: 0, y1: 1, fillcolor: css("--wash"), line: { width: 0 }, layer: "below" })),
+      { type: "line", xref: "x", yref: "paper", x0: plotT(tau), x1: plotT(tau), y0: 0, y1: 1, line: { color: css("--text-secondary"), width: 1 } },
+      { type: "line", xref: "paper", yref: "y2", x0: 0, x1: 1, y0: 0.1, y1: 0.1, line: { color: css("--axis"), width: 1 } },
+      { type: "line", xref: "paper", yref: "y2", x0: 0, x1: 1, y0: 1.9, y1: 1.9, line: { color: css("--axis"), width: 1 } },
+    ],
+    annotations: [{ xref: "x", yref: "paper", x: plotT(tau), y: 1, text: "now", showarrow: false, xanchor: "left", font: { color: css("--text-secondary"), size: 11 } }],
+  };
+  Plotly.react("chart", traces, layout, { displayModeBar: false, responsive: true });
+
+  const notes = [];
+  if (market.p5min) notes.push(`P5MIN run ${market.p5min.run_time.replace("T", " ").slice(0, 16)}`);
+  if (market.predispatch) notes.push(`predispatch run ${market.predispatch.run_time.replace("T", " ").slice(0, 16)}`);
+  if (disp && disp.available) notes.push(`agent SOC from the ${disp.source} evaluation, net revenue to date ${money(disp.net_revenue_to_date)}`);
+  else if (disp && disp.reason) notes.push(`agent SOC: ${disp.reason}`);
+  $("chart-note").textContent = notes.join(" · ") + ". Shaded bands are the scored holdout episodes; SOC limits 0.1–1.9 MWh shown as hairlines.";
+}
+
+function drawBid(disp) {
+  const box = $("bid-table");
+  box.replaceChildren();
+  if (!disp || !disp.available) {
+    $("bid-summary").textContent = !state.sub ? "Select a submission to see its bids."
+      : disp && disp.reason ? `No bids here: ${disp.reason}. Use the Episode menu to jump to one.` : "This submission has no results for this region yet.";
+    Plotly.purge("bidchart");
+    return;
+  }
+  if (!disp.next) { $("bid-summary").textContent = "No interval after this time."; Plotly.purge("bidchart"); return; }
+  const n = disp.next;
+  if (!n.bid) { $("bid-summary").textContent = `Interval ending ${n.interval_end.slice(11, 16)}: no bid (${n.rejected || "policy error"})`; Plotly.purge("bidchart"); return; }
+  $("bid-summary").textContent = `Interval ending ${n.interval_end.replace("T", " ").slice(0, 16)}, starting at ${n.energy_start_mwh.toFixed(2)} MWh.` +
+    (n.rejected ? ` Rejected: ${n.rejected}` : "") + " Net MW the bid clears to at each price:";
+  const c = n.bid.curve;
+  const clip = $("clip").checked;
+  Plotly.react("bidchart", [{ x: c.price, y: c.mw, mode: "lines+markers", line: { shape: "hv", color: css("--series-1"), width: 2 },
+    marker: { size: 6, color: css("--series-1") }, hovertemplate: "at $%{x:,.0f}: %{y:.2f} MW<extra></extra>" }], {
+    paper_bgcolor: css("--surface-1"), plot_bgcolor: css("--surface-1"), margin: { l: 48, r: 10, t: 6, b: 34 }, showlegend: false,
+    xaxis: axisStyle({ title: { text: "Price ($/MWh)" }, range: clip ? [-1000, 1000] : undefined }),
+    yaxis: axisStyle({ title: { text: "MW" }, range: [-1.1, 1.1] }),
+  }, { displayModeBar: false, responsive: true });
+
+  const table = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "Band"), el("th", {}, "Load $"), el("th", {}, "Load MW"), el("th", {}, "Gen $"), el("th", {}, "Gen MW"))));
+  const tbody = el("tbody");
+  const L = n.bid.load, G = n.bid.gen;
+  for (let i = 0; i < 10; i++) {
+    tbody.append(el("tr", {}, el("td", {}, String(i + 1)),
+      el("td", {}, Math.round(L.prices[i]).toLocaleString()), el("td", { class: L.effective_mw[i] > 0 ? "eff" : "" }, L.effective_mw[i].toFixed(2)),
+      el("td", {}, Math.round(G.prices[i]).toLocaleString()), el("td", { class: G.effective_mw[i] > 0 ? "eff" : "" }, G.effective_mw[i].toFixed(2))));
+  }
+  table.append(tbody);
+  box.append(table, el("div", { class: "muted", style: "font-size:12px;margin-top:4px" },
+    `MaxAvail: load ${L.max_avail.toFixed(2)} MW, gen ${G.max_avail.toFixed(2)} MW. MW shown are effective (after MaxAvail).`));
+}
+
+// ---------- score progress ----------
+
+const X_AXES = {
+  wall_s: { title: "Wall time (h)", scale: 1 / 3600, fmt: (v) => mins(v) },
+  active_s: { title: "Active model time (h)", scale: 1 / 3600, fmt: (v) => mins(v) },
+  cost_usd: { title: "API-equivalent cost ($)", scale: 1, fmt: (v) => "$" + v.toFixed(2) },
+  output_tokens: { title: "Output tokens", scale: 1, fmt: compact },
+  total_tokens: { title: "Total tokens (incl. cache)", scale: 1, fmt: compact },
+};
+
+function drawProgress(s) {
+  if (!s) { Plotly.purge("progress"); $("progress-note").textContent = ""; return; }
+  const xKey = $("progress-x").value, yKey = $("progress-y").value, ax = X_AXES[xKey];
+  const pf = s.perfect_foresight_holdout_net_revenue;
+  const yOf = (sub) => yKey === "pct" ? sub.pct_of_perfect : sub.net_revenue;
+  const done = s.submissions.filter((x) => x.state === "done" && x.x);
+  const valid = done.filter((x) => x.valid && yOf(x) != null);
+  const invalid = done.filter((x) => !x.valid);
+  const xOf = (sub) => sub.x[xKey] * ax.scale;
+  const nowX = s.now_x[xKey] * ax.scale;
+
+  // Best valid submission so far: a step line that only ever rises, extended to now.
+  const bx = [], by = [];
+  let best = null;
+  for (const sub of [...valid].sort((a, b) => xOf(a) - xOf(b))) {
+    const y = yOf(sub);
+    if (best === null || y > best) {
+      if (best !== null) { bx.push(xOf(sub)); by.push(best); }
+      bx.push(xOf(sub)); by.push(y); best = y;
+    }
+  }
+  if (best !== null) { bx.push(Math.max(nowX, bx[bx.length - 1])); by.push(best); }
+
+  const hover = (sub) => `#${sub.n} · ${yKey === "pct" ? pct(sub.pct_of_perfect) : money(sub.net_revenue)}<br>${ax.fmt(sub.x[xKey])}<br>${(sub.summary || "").slice(0, 90)}`;
+  const traces = [
+    { name: "Best so far", x: bx, y: by, mode: "lines", line: { color: css("--series-1"), width: 4, shape: "hv" }, hoverinfo: "skip" },
+    { name: "Submission", x: valid.map(xOf), y: valid.map(yOf), mode: "markers+text", text: valid.map((x) => `#${x.n}`),
+      textposition: "top center", textfont: { color: css("--text-secondary"), size: 11 },
+      marker: { size: 9, color: css("--surface-1"), line: { color: css("--text-secondary"), width: 2 } },
+      hovertext: valid.map(hover), hoverinfo: "text" },
+  ];
+  if (invalid.length) traces.push({ name: "Invalid (no credit)", x: invalid.map(xOf), y: invalid.map(() => 0), mode: "markers",
+    marker: { size: 10, symbol: "x-thin-open", color: css("--critical"), line: { width: 2, color: css("--critical") } },
+    hovertext: invalid.map((x) => `#${x.n} · invalid<br>${ax.fmt(x.x[xKey])}`), hoverinfo: "text" });
+
+  const ff = s.final_full_month;
+  if (ff && ff.pct_of_perfect != null && yKey === "pct") {
+    traces.push({ name: "Full month (final)", x: [nowX], y: [ff.pct_of_perfect], mode: "markers+text", text: [`full month #${ff.n}`],
+      textposition: "middle left", textfont: { color: css("--text-primary"), size: 11 },
+      marker: { size: 13, symbol: "diamond", color: css("--series-2"), line: { color: css("--surface-1"), width: 2 } },
+      hovertext: [`Full holdout month, submission #${ff.n}: ${pct(ff.pct_of_perfect)}`], hoverinfo: "text" });
+  }
+  const baseline = yKey === "pct" ? s.baseline_holdout_pct : s.baseline_holdout_net_revenue;
+  const shapes = [], annotations = [];
+  if (baseline != null) {
+    shapes.push({ type: "line", xref: "paper", x0: 0, x1: 1, y0: baseline, y1: baseline, line: { color: css("--text-muted"), width: 1 } });
+    annotations.push({ xref: "paper", x: 0, y: baseline, yanchor: "bottom", xanchor: "left", showarrow: false,
+      text: `baseline ${yKey === "pct" ? pct(baseline) : money(baseline)}`, font: { color: css("--text-muted"), size: 11 } });
+  }
+  shapes.push({ type: "line", x0: nowX, x1: nowX, xref: "x", yref: "paper", y0: 0, y1: 1, line: { color: css("--axis"), width: 1 } });
+  annotations.push({ x: nowX, xref: "x", yref: "paper", y: 1, yanchor: "bottom", xanchor: "right", showarrow: false,
+    text: s.axes_frozen ? "run end" : "now", font: { color: css("--text-muted"), size: 11 } });
+
+  const ys = [...by, ...valid.map(yOf), baseline ?? 0, 0, ...(ff && yKey === "pct" && ff.pct_of_perfect != null ? [ff.pct_of_perfect] : [])];
+  Plotly.react("progress", traces, {
+    paper_bgcolor: css("--surface-1"), plot_bgcolor: css("--surface-1"), font: { color: css("--text-primary"), family: "system-ui, sans-serif" },
+    margin: { l: 70, r: 16, t: 10, b: 44 }, showlegend: true,
+    legend: { orientation: "h", y: -0.22, font: { color: css("--text-secondary"), size: 12 } },
+    hoverlabel: { bgcolor: css("--surface-1"), bordercolor: css("--axis"), font: { color: css("--text-primary") } },
+    xaxis: axisStyle({ title: { text: ax.title }, range: [0, Math.max(nowX, ...valid.map(xOf), ...invalid.map(xOf)) * 1.05 || 1], zeroline: false }),
+    yaxis: axisStyle({ title: { text: yKey === "pct" ? "% of perfect foresight" : "Net revenue, holdout ($)" },
+      range: [Math.min(0, ...ys) * 1.1 - 0.05 * Math.max(...ys), Math.max(...ys) * 1.15 || 1], tickprefix: yKey === "pct" ? "" : "$", ticksuffix: yKey === "pct" ? "%" : "" }),
+    shapes, annotations,
+  }, { displayModeBar: false, responsive: true });
+
+  $("progress-note").textContent = done.length
+    ? `Best: ${best === null ? "no valid submission" : (yKey === "pct" ? pct(best) : money(best))}` +
+      (pf && best !== null && yKey !== "pct" ? ` (perfect foresight ${money(pf)})` : "") +
+      ". Scores are on the sampled holdout episodes. Invalid submissions earn no credit and sit at zero." +
+      (ff ? (yKey === "pct" ? " The diamond is the final submission scored on the full month." : " Switch to % to compare with the full-month final score.") : "")
+    : "No scored submissions yet.";
+}
+
+// ---------- data loading ----------
+
+async function refreshTime() {
+  if (state.inflight) { state.pending = true; return; }
+  state.inflight = true;
+  $("chart").classList.add("stale");
+  try {
+    const tau = isoT(state.tauMs);
+    const [market, disp] = await Promise.all([
+      api(`/api/market?region=${state.region}&tau=${tau}`),
+      state.run && state.sub ? api(`/api/dispatch?id=${encodeURIComponent(state.run)}&n=${state.sub}&region=${state.region}&tau=${tau}`) : null,
+    ]);
+    drawChart(market, disp);
+    drawBid(disp);
+  } catch (e) {
+    $("chart-note").replaceChildren(el("span", { class: "error" }, String(e)));
+  } finally {
+    $("chart").classList.remove("stale");
+    state.inflight = false;
+    if (state.pending) { state.pending = false; refreshTime(); }
+  }
+}
+
+function setTau(ms) {
+  state.tauMs = Math.max(state.startMs, Math.min(state.endMs - STEP_MS, ms));
+  $("tau-label").textContent = fmtT(state.tauMs);
+  $("slider").value = Math.round((state.tauMs - state.startMs) / STEP_MS);
+  refreshTime();
+}
+
+function tile(label, value, sub) {
+  return el("div", { class: "card tile" }, el("div", { class: "label" }, label), el("div", { class: "value" }, value), el("div", { class: "sub" }, sub || ""));
+}
+
+function renderStatus(s) {
+  const tiles = $("tiles");
+  tiles.replaceChildren();
+  if (!s) return;
+  const used = s.submissions.length, max = s.args ? s.args.max_submissions : "?";
+  const tok = s.tokens;
+  const toolCalls = Object.values(s.tools).reduce((a, t) => a + t.calls, 0);
+  tiles.append(
+    tile("Status", !s.running ? "Ended" : s.paused_until ? "Paused" : s.stopped ? "Stopped" : "Running",
+      s.paused_until ? `usage limit · resumes ${new Date(s.paused_until * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+        : s.stopped ? `restart with --resume ${s.run_id}`
+        : [s.model, !s.running && (s.ended_by || "").replaceAll("_", " ")].filter(Boolean).join(" · ")),
+    tile("Active time", mins(s.active_s ?? s.elapsed_s), (s.args ? `limit ${s.args.max_hours} h` : "") + ` · wall ${mins(s.elapsed_s)}`),
+    tile("API-equivalent cost", "$" + s.cost_usd.toFixed(2), s.args ? `limit $${s.args.max_cost}` : ""),
+    tile("Tokens", compact(tok.input_tokens + tok.cache_read_input_tokens + tok.cache_creation_input_tokens) + " in", `${compact(tok.output_tokens)} out · ${compact(tok.cache_read_input_tokens)} cache read`),
+    tile("API calls", String(s.api_calls), ""),
+    tile("Tool calls", String(toolCalls), Object.entries(s.tools).sort((a, b) => b[1].calls - a[1].calls).slice(0, 3).map(([k, v]) => `${k.replace("mcp__harness__", "")} ${v.calls}`).join(" · ")),
+    tile("Full month (final)", s.final_full_month ? pct(s.final_full_month.pct_of_perfect) : "–",
+      s.final_full_month ? `submission #${s.final_full_month.n}${s.final_full_month.valid ? "" : " · invalid"} · baseline ${pct(s.baseline_full_month_pct)}`
+        : "scored after the run ends"),
+    tile("Submissions", `${used} / ${max}`, s.submissions.some((x) => x.state === "evaluating") ? "evaluating…" : ""),
+    tile("Final score (episodes)", pct(s.final_pct_of_perfect),
+      `last valid submission · best ${pct(Math.max(...s.submissions.filter((x) => x.valid).map((x) => x.pct_of_perfect), -Infinity) > -Infinity ? Math.max(...s.submissions.filter((x) => x.valid).map((x) => x.pct_of_perfect)) : null)} · baseline ${pct(s.baseline_holdout_pct)}`),
+  );
+
+  // submissions select + cards
+  const sel = $("submission");
+  const done = s.submissions.filter((x) => x.state === "done");
+  const prev = sel.value;
+  sel.replaceChildren(el("option", { value: "" }, done.length ? "(none)" : "(none yet)"),
+    ...done.map((x) => el("option", { value: String(x.n) }, `#${x.n} · ${pct(x.pct_of_perfect)}${x.valid ? "" : " invalid"}`)));
+  if (prev && done.some((x) => String(x.n) === prev)) sel.value = prev;
+  else if (done.length && !state.userPickedSub) { sel.value = String(done[done.length - 1].n); }
+  if (sel.value !== state.sub) { state.sub = sel.value; refreshTime(); renderDetail(); }
+
+  const subs = $("subs");
+  subs.replaceChildren();
+  if (!s.submissions.length) subs.append(el("span", { class: "muted" }, "No submissions yet."));
+  for (const x of s.submissions) {
+    const status = x.state !== "done" ? el("span", { class: "pill wait" }, "evaluating") : x.valid ? el("span", { class: "pill good" }, "valid") : el("span", { class: "pill bad" }, "invalid");
+    const card = el("button", { class: "card sub-card", "aria-pressed": String(String(x.n) === state.sub), onclick: () => { state.userPickedSub = true; sel.value = String(x.n); sel.dispatchEvent(new Event("change")); } },
+      el("div", { class: "row", style: "justify-content:space-between" }, el("strong", {}, `#${x.n} · ${x.state === "done" ? pct(x.pct_of_perfect) : "…"}`), status),
+      el("div", { class: "secondary", style: "font-size:12px" }, `submitted at ${mins(x.submitted_s)}` + (x.eval_seconds ? ` · eval ${mins(x.eval_seconds)}` : "")),
+      el("div", { style: "margin-top:4px" }, (x.summary || "").slice(0, 220) + ((x.summary || "").length > 220 ? "…" : "")));
+    subs.append(card);
+  }
+
+  // feed
+  const feed = $("feed");
+  feed.replaceChildren();
+  for (const f of [...s.feed].reverse()) {
+    feed.append(el("div", { class: `entry ${f.kind}` }, el("div", { class: "meta" }, `${mins(f.elapsed_s)} · ${f.kind}`), (f.text || "").slice(0, 1200)));
+  }
+}
+
+async function renderDetail() {
+  const box = $("detail");
+  box.replaceChildren();
+  if (!state.run || !state.sub) return;
+  const n = Number(state.sub);
+  const s = state.status && state.status.submissions.find((x) => x.n === n);
+  const [policy, story] = await Promise.all([
+    api(`/api/policy?id=${encodeURIComponent(state.run)}&n=${n}`),
+    api(`/api/narrative?id=${encodeURIComponent(state.run)}&n=${n}`),
+  ]);
+  const d = policy.description || {};
+  box.append(el("h3", {}, `Submission #${n}` + (s && s.per_region ? " · per region: " + Object.entries(s.per_region).map(([r, v]) => `${r} ${pct(v)}`).join(", ") : "")));
+  if (s && s.error) box.append(el("p", { class: "error" }, s.error));
+  box.append(el("h3", {}, "What the policy does"), el("p", {}, d.summary || "–"));
+  box.append(el("h3", {}, "Why (agent's rationale)"), el("p", {}, d.rationale || "–"));
+  const narrative = el("details", {}, el("summary", {}, `Agent reasoning leading up to this submission (${story.length} entries)`));
+  const list = el("div", { class: "feed" });
+  for (const f of story) list.append(el("div", { class: `entry ${f.kind}` }, el("div", { class: "meta" }, `${mins(f.elapsed_s)} · ${f.kind}`), f.text));
+  narrative.append(list);
+  box.append(narrative);
+  for (const f of policy.files) {
+    box.append(el("details", {}, el("summary", {}, f.path), el("pre", {}, f.source)));
+  }
+}
+
+async function pollRun() {
+  if (!state.run) { renderStatus(null); drawProgress(null); return; }
+  try {
+    state.status = await api(`/api/run?id=${encodeURIComponent(state.run)}`);
+    renderStatus(state.status);
+    drawProgress(state.status);
+  } catch (e) {
+    $("feed").replaceChildren(el("span", { class: "error" }, String(e)));
+  }
+}
+
+async function init() {
+  state.meta = await api("/api/meta");
+  state.startMs = parseT(state.meta.start);
+  state.endMs = parseT(state.meta.end);
+  $("slider").max = Math.round((state.endMs - state.startMs) / STEP_MS) - 1;
+  $("region").replaceChildren(...state.meta.regions.map((r) => el("option", { value: r }, r)));
+  $("region").value = state.region;
+  $("run").replaceChildren(el("option", { value: "" }, "(none)"), ...state.meta.runs.map((r) => el("option", { value: r }, r)));
+  if (state.meta.runs.length) { $("run").value = state.meta.runs[0]; state.run = state.meta.runs[0]; }
+
+  $("episode").replaceChildren(el("option", { value: "" }, "jump to…"),
+    ...state.meta.episodes.map(([a, b], k) => el("option", { value: a }, `${k + 1}: ${a.slice(5, 10)} – ${b.slice(5, 10)}`)));
+  $("episode").addEventListener("change", (e) => { if (e.target.value) setTau(parseT(e.target.value)); e.target.value = ""; });
+  $("region").addEventListener("change", (e) => { state.region = e.target.value; refreshTime(); });
+  $("run").addEventListener("change", (e) => { state.run = e.target.value; state.sub = ""; state.userPickedSub = false; $("submission").value = ""; pollRun(); refreshTime(); renderDetail(); });
+  $("submission").addEventListener("change", (e) => { state.sub = e.target.value; refreshTime(); renderDetail(); if (state.status) renderStatus(state.status); });
+  $("clip").addEventListener("change", refreshTime);
+  ["progress-x", "progress-y"].forEach((id) => $(id).addEventListener("change", () => drawProgress(state.status)));
+  $("slider").addEventListener("input", (e) => setTau(state.startMs + Number(e.target.value) * STEP_MS));
+  document.querySelectorAll("[data-step]").forEach((b) => b.addEventListener("click", () => setTau(state.tauMs + Number(b.dataset.step) * 60e3)));
+  $("play").addEventListener("click", () => {
+    if (state.playing) { clearInterval(state.playing); state.playing = null; $("play").textContent = "Play"; return; }
+    $("play").textContent = "Pause";
+    state.playing = setInterval(() => { if (!state.inflight) setTau(state.tauMs + STEP_MS); }, 250);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement.tagName) && document.activeElement.type !== "range") return;
+    if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+      e.preventDefault();
+      const dir = e.key === "ArrowRight" ? 1 : -1;
+      setTau(state.tauMs + dir * (e.shiftKey ? 12 : 1) * STEP_MS);
+    }
+  });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", refreshTime);
+
+  const params = new URLSearchParams(location.search);   // e.g. ?region=VIC1&tau=2026-08-03T17:00
+  if (params.get("region")) { state.region = params.get("region"); $("region").value = state.region; }
+  if (params.get("run") !== null) { state.run = params.get("run"); $("run").value = state.run; }
+  setTau(params.get("tau") ? parseT(params.get("tau")) : state.startMs + 4 * 3600e3);
+  pollRun();
+  setInterval(pollRun, 5000);
+  setInterval(async () => {   // pick up new runs
+    const meta = await api("/api/meta");
+    const sel = $("run"), cur = sel.value;
+    if (meta.runs.join() !== state.meta.runs.join()) {
+      state.meta.runs = meta.runs;
+      sel.replaceChildren(el("option", { value: "" }, "(none)"), ...meta.runs.map((r) => el("option", { value: r }, r)));
+      sel.value = cur;
+    }
+  }, 15000);
+}
+
+init().catch((e) => $("chart-note").replaceChildren(el("span", { class: "error" }, String(e))));
+</script>
+</body>
+</html>

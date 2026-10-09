@@ -1,0 +1,46 @@
+# Default benchmark configuration. Pass another file with
+#   uv run scripts/run_benchmark.py --config config/<name>.toml
+
+[battery]
+power_mw = 1.0
+energy_mwh = 2.0
+charge_eff = 0.9            # one-way; round trip = charge_eff * discharge_eff
+discharge_eff = 0.9
+soc_min_frac = 0.05
+soc_max_frac = 0.95
+initial_soc_frac = 0.5
+degradation_cost = 5.0      # $/MWh throughput, charged on both charge and discharge
+ramp_rate_mw_per_min = 1.0  # the unit's ramp rate (MW/min); every bid must state exactly this
+
+[terminal]
+# Soft end-of-horizon SOC target: the optimiser pays soc_shortfall_penalty for
+# every MWh the final SOC falls below soc_target_frac * energy_mwh. A penalty of
+# 0 means no terminal condition at all, so the optimiser will drain the battery
+# at the end of each horizon.
+soc_target_frac = 0.5
+soc_shortfall_penalty = 0.0 # $/MWh
+
+[market]
+mfp = -1000.0               # market floor price, $/MWh
+mpc = 23200.0               # market price cap, $/MWh (FY2026-27)
+gen_mlf = 1.0               # marginal loss factors; bid price at RRN = connection-point price / MLF
+load_mlf = 1.0
+# AEMO fixes band prices for each trading day (04:00-04:00); rebids can only
+# move MW between bands. When true, a bid that changes prices mid-day is rejected.
+lock_daily_prices = true
+# Reject bids whose ramp rates differ from battery.ramp_rate_mw_per_min.
+enforce_bid_ramp_rate = true
+# Dispatch moves in a straight line from the start-of-interval MW to the target;
+# energy, revenue and SOC follow that path (AEMO's dispatch trajectory).
+linear_dispatch_trajectory = true
+
+[bidding]
+# Daily price bands ($/MWh at the connection point) for price-band bidding
+# policies (milp_bid_curve). Fixed for every trading day. Each side needs 10
+# strictly increasing prices in [MFP*MLF, MPC*MLF]. Interleaving the two
+# sides gives the bid curve 20 distinct price points.
+load_prices = [-1000, -100, -20, 20, 60, 100, 170, 300, 1000, 10000]
+gen_prices = [-500, -50, 0, 40, 80, 130, 220, 500, 3000, 23200]
+
+[solver]
+mip_rel_gap = 1e-4
