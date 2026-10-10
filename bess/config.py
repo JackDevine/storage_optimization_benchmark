@@ -31,19 +31,21 @@ class Market:
     # AEMO fixes band prices for the trading day: rebids may only move MW
     # between bands. When true, a bid that changes prices mid-day is rejected.
     lock_daily_prices: bool = True
-    # A bid must state the unit's ramp rate (battery.ramp_rate_mw_per_min); it
-    # can't choose its own. When true, a bid with any other ramp rate is
-    # rejected. config/default.toml turns this on. The code default stays off so
-    # configs saved before this setting existed (e.g. a run in progress) keep
-    # the rules they started with.
-    enforce_bid_ramp_rate: bool = False
-    # AEMO dispatch targets are end-of-interval MW: the unit moves in a straight
-    # line from its MW at the start of the interval to the target, and that path
-    # is what gets metered and settled. When true, the simulator settles that
-    # trajectory's energy (and the MILP policies plan with it). When false, MW is
-    # held flat over the interval. Off in code for the same reason as above;
-    # config/default.toml turns it on.
-    linear_dispatch_trajectory: bool = False
+
+
+# Market options that were removed when their behaviour became the only one: the
+# straight-line dispatch trajectory, and ramping at the unit's own rate. Older
+# config files and run records still carry them, so `true` is accepted and
+# ignored; `false` asks for behaviour that no longer exists.
+REMOVED_MARKET_OPTIONS = ("enforce_bid_ramp_rate", "linear_dispatch_trajectory")
+
+
+def market_from_dict(d: dict) -> Market:
+    d = dict(d)
+    for key in REMOVED_MARKET_OPTIONS:
+        if key in d and not d.pop(key):
+            raise ValueError(f"market.{key} = false is no longer supported (the option was removed; it's always on)")
+    return Market(**d)
 
 
 @dataclass(frozen=True)
@@ -75,7 +77,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
         name=path.stem,
         battery=Battery(**raw.get("battery", {})),
         terminal=TerminalCondition(**raw.get("terminal", {})),
-        market=Market(**raw.get("market", {})),
+        market=market_from_dict(raw.get("market", {})),
         bidding=Bidding(**{k: tuple(v) for k, v in raw.get("bidding", {}).items()}),
         mip_rel_gap=raw.get("solver", {}).get("mip_rel_gap", 1e-4),
     )

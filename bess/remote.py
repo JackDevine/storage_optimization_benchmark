@@ -24,7 +24,7 @@ import pandas as pd
 
 from bess.battery import Battery
 from bess.bid import BDUBid, bid_from_dict, bid_to_dict
-from bess.config import Bidding, Config, Market, TerminalCondition
+from bess.config import Bidding, Config, TerminalCondition, market_from_dict
 from bess.data import Forecast
 from bess.observation import Observation
 
@@ -42,7 +42,7 @@ def config_from_dict(d: dict) -> Config:
         name=d["name"],
         battery=Battery(**d["battery"]),
         terminal=TerminalCondition(**d["terminal"]),
-        market=Market(**d["market"]),
+        market=market_from_dict(d["market"]),
         bidding=Bidding(**{k: tuple(v) for k, v in d["bidding"].items()}),
         mip_rel_gap=d["mip_rel_gap"],
     )

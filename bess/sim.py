@@ -9,17 +9,15 @@ for intervals already ended. For each interval the simulator:
    checks the band prices match the first accepted bid of the trading day.
    A rejected bid is dispatched at 0 MW.
 2. Clears the bid as a price-taker at the ACTUAL dispatch price, then limits
-   the change from last interval's MW by the unit's ramp rate. (With
-   market.enforce_bid_ramp_rate, a bid must state that ramp rate: one that
-   doesn't is still dispatched but recorded as bid non-conformance. Without
-   it, the bid's own ramp rates are used.)
-3. Clips that to what the battery can physically do (power, SOC). AEMO doesn't
-   track SOC; keeping dispatch feasible is the participant's job, so any
-   clipping is recorded as non-conformance.
-4. Updates energy and settles at the actual price (5-min settlement). With
-   market.linear_dispatch_trajectory the unit moves in a straight line from
-   its start-of-interval MW to the target (AEMO's dispatch trajectory), and the
-   energy settled is the area under that line. Otherwise MW is held flat.
+   the change from last interval's MW by the unit's ramp rate. A bid must
+   state that ramp rate: one that doesn't is still dispatched but recorded as
+   bid non-conformance.
+3. Moves the unit in a straight line from its start-of-interval MW to that
+   end-of-interval target (AEMO's dispatch trajectory), clipped to what the
+   battery can physically do (power, SOC along the path). AEMO doesn't track
+   SOC; keeping dispatch feasible is the participant's job, so any clipping is
+   recorded as non-conformance.
+4. Settles the energy under that line at the actual price (5-min settlement).
 
 A run with any rejected bid, non-conformance or bid non-conformance is still
 scored but marked invalid.
@@ -32,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 from bess.battery import Battery
-from bess.bid import BDUBid, bid_to_dict, dispatch_at_price, ramp_rate_mismatch, validate
+from bess.bid import bid_to_dict, dispatch_at_price, ramp_rate_mismatch, validate
 from bess.config import Config
 from bess.data import INTERVAL, RegionData
 from bess.observation import Observation, Policy
@@ -57,28 +55,10 @@ def trading_day(interval_end: pd.Timestamp) -> pd.Timestamp:
     return (interval_end - INTERVAL - TRADING_DAY_START).normalize()
 
 
-def apply_ramp(target: float, previous: float, bid: BDUBid) -> float:
-    """Limit the move from `previous` MW. Rates come from the side the unit is
-    on at the start of the interval (an approximation for moves that cross 0)."""
-    if previous > 0:
-        up, down = bid.gen.ramp_up_rate, bid.gen.ramp_down_rate
-    elif previous < 0:
-        up, down = bid.load.ramp_down_rate, bid.load.ramp_up_rate
-    else:
-        up, down = bid.gen.ramp_up_rate, bid.load.ramp_up_rate
-    return float(np.clip(target, previous - down * DT_MIN, previous + up * DT_MIN))
-
-
 def apply_unit_ramp(target: float, previous: float, rate_mw_per_min: float) -> float:
     """Limit the move from `previous` MW by the unit's ramp rate, either direction."""
     step = rate_mw_per_min * DT_MIN
     return float(np.clip(target, previous - step, previous + step))
-
-
-def clip_power(mw: float, energy: float, b: Battery) -> float:
-    max_discharge = min(b.power_mw, (energy - b.e_min) * b.discharge_eff / DT_H)
-    max_charge = min(b.power_mw, (b.e_max - energy) / (b.charge_eff * DT_H))
-    return min(max(mw, -max(max_charge, 0.0)), max(max_discharge, 0.0))
 
 
 def trajectory_energies(p0: float, p1: float) -> tuple[float, float, float | None]:
@@ -146,12 +126,6 @@ def settle_trajectory(target: float, p0: float, energy: float, b: Battery, ramp_
     return p1, discharged, charged, shortfall
 
 
-def energy_after(mw: float, energy: float, b: Battery) -> float:
-    if mw >= 0:
-        return energy - mw * DT_H / b.discharge_eff
-    return energy - mw * DT_H * b.charge_eff
-
-
 def simulate(
     policy: Policy,
     data: RegionData,
@@ -199,21 +173,13 @@ def simulate(
             if state.locked_prices is None:
                 state.locked_prices = bid.price_bands
             cleared = dispatch_at_price(bid, price, market)
-            if market.enforce_bid_ramp_rate:
-                bid_nonconformance = ramp_rate_mismatch(bid, battery)
-                target = apply_unit_ramp(cleared, state.mw, battery.ramp_rate_mw_per_min)
-            else:
-                target = apply_ramp(cleared, state.mw, bid)
+            bid_nonconformance = ramp_rate_mismatch(bid, battery)
+            target = apply_unit_ramp(cleared, state.mw, battery.ramp_rate_mw_per_min)
 
         energy_start = state.energy_mwh
-        if market.linear_dispatch_trajectory:
-            ramp_step = battery.ramp_rate_mw_per_min * DT_MIN if market.enforce_bid_ramp_rate else float("inf")
-            mw, discharged, charged, shortfall = settle_trajectory(target, state.mw, energy_start, battery, ramp_step)
-            state.energy_mwh = energy_start - discharged / battery.discharge_eff + charged * battery.charge_eff
-        else:
-            mw = clip_power(target, energy_start, battery)
-            discharged, charged, shortfall = max(mw, 0.0) * DT_H, max(-mw, 0.0) * DT_H, 0.0
-            state.energy_mwh = energy_after(mw, energy_start, battery)
+        ramp_step = battery.ramp_rate_mw_per_min * DT_MIN
+        mw, discharged, charged, shortfall = settle_trajectory(target, state.mw, energy_start, battery, ramp_step)
+        state.energy_mwh = energy_start - discharged / battery.discharge_eff + charged * battery.charge_eff
         state.mw = mw
 
         records.append(
@@ -240,19 +206,13 @@ def simulate(
 
 
 def summarise(results: pd.DataFrame, battery: Battery) -> dict:
-    if "discharged_mwh" in results:
-        discharged, charged = results.discharged_mwh.sum(), results.charged_mwh.sum()
-    else:
-        discharged = results.mw.clip(lower=0).sum() * DT_H
-        charged = (-results.mw).clip(lower=0).sum() * DT_H
+    discharged, charged = results.discharged_mwh.sum(), results.charged_mwh.sum()
     revenue = results.revenue.sum()
     deg = results.degradation_cost.sum()
     days = len(results) * DT_H / 24
-    nonconforming = results.nonconformance_mw.abs() > TOLERANCE_MW
-    if "energy_shortfall_mwh" in results:
-        nonconforming |= results.energy_shortfall_mwh > 1e-9
+    nonconforming = (results.nonconformance_mw.abs() > TOLERANCE_MW) | (results.energy_shortfall_mwh > 1e-9)
     rejected = int(results.bid_rejected.notna().sum())
-    bid_nonconforming = int(results.bid_nonconformance.notna().sum()) if "bid_nonconformance" in results else 0
+    bid_nonconforming = int(results.bid_nonconformance.notna().sum())
     return dict(
         start=results.interval_end.min() - INTERVAL,
         end=results.interval_end.max(),

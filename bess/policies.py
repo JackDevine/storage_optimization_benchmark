@@ -30,15 +30,11 @@ HOUR = pd.Timedelta(hours=1)
 
 def dynamics(config: Config, p_prev: float) -> dict:
     """MILP options so the plan matches how the simulator settles dispatch: the
-    straight-line trajectory from the current MW, and the unit's ramp rate."""
-    market = config.market
-    if not market.linear_dispatch_trajectory:
-        return {}
-    ramp = config.battery.ramp_rate_mw_per_min if market.enforce_bid_ramp_rate else None
-    # Covers the MILP's zero-crossing approximation: at most about a quarter of one
-    # interval's full-power energy; a third leaves room for solver tolerances.
-    margin = config.battery.power_mw * (5 / 60) / 3
-    return {"p_prev": p_prev, "trajectory": True, "ramp_mw_per_min": ramp, "soc_margin_mwh": margin}
+    straight-line trajectory starts from the current MW, and the plan keeps a
+    small SOC margin for the MILP's zero-crossing approximation (at most about a
+    quarter of one interval's full-power energy; a third leaves room for solver
+    tolerances)."""
+    return {"p_prev": p_prev, "soc_margin_mwh": config.battery.power_mw * (5 / 60) / 3}
 
 
 def blended_forecast(obs: Observation) -> tuple[np.ndarray, np.ndarray]:

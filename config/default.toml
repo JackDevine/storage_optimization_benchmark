@@ -28,11 +28,6 @@ load_mlf = 1.0
 # AEMO fixes band prices for each trading day (04:00-04:00); rebids can only
 # move MW between bands. When true, a bid that changes prices mid-day is rejected.
 lock_daily_prices = true
-# Reject bids whose ramp rates differ from battery.ramp_rate_mw_per_min.
-enforce_bid_ramp_rate = true
-# Dispatch moves in a straight line from the start-of-interval MW to the target;
-# energy, revenue and SOC follow that path (AEMO's dispatch trajectory).
-linear_dispatch_trajectory = true
 
 [bidding]
 # Daily price bands ($/MWh at the connection point) for price-band bidding

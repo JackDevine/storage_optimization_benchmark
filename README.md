@@ -72,8 +72,8 @@ by (config, policy, region), where config is the config file's name.
   3. Applies the unit's ramp rate. A bid stating any other ramp rate is still dispatched, but flagged as
      `bid_nonconformance`, which makes the run invalid.
   4. Moves the battery in a straight line from its start-of-interval MW to the end-of-interval target (AEMO's
-     dispatch trajectory, `market.linear_dispatch_trajectory`). It settles the energy under that line,
-     discharge and charge each with their own efficiency, and clips to power and SOC limits along the way.
+     dispatch trajectory). It settles the energy under that line, discharge and charge each with their own
+     efficiency, and clips to power and SOC limits along the way.
      The MILP policies plan with the same trajectory and ramp limits, plus a small SOC margin
      (`bess.policies.dynamics`).
   Any clipping counts as **non-conformance**, since AEMO doesn't track SOC and managing it through MaxAvail is the

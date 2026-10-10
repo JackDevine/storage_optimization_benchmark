@@ -42,7 +42,7 @@ REFERENCE_POLICY_DIR = Path(__file__).resolve().parent / "reference_policy"
 REFERENCE_DIR = PROJECT_ROOT / "data" / "reference_scores"
 REFERENCE_PATH = PROJECT_ROOT / "data" / "reference_scores.json"  # legacy: one file for the default config
 # Bump when the simulator's scoring rules change, so baselines get recomputed.
-SIM_VERSION = 2  # 2: straight-line dispatch trajectory
+SIM_VERSION = 2  # 2: straight-line dispatch trajectory and the unit's ramp rate (1: flat MW, bid's own ramp rates; removed)
 
 
 def config_fingerprint(config: Config) -> str:
@@ -50,8 +50,17 @@ def config_fingerprint(config: Config) -> str:
     market rules, terminal condition, ...) plus the simulator version."""
     d = config_to_dict(config)
     d.pop("name")
-    blob = json.dumps({"sim_version": SIM_VERSION, **d}, sort_keys=True)
+    blob = json.dumps({"sim_version": SIM_VERSION, **_floats(d)}, sort_keys=True)
     return hashlib.sha1(blob.encode()).hexdigest()[:12]
+
+
+def _floats(x):
+    """Numbers as floats, so `ramp_rate_mw_per_min = 1` and `= 1.0` fingerprint the same."""
+    if isinstance(x, dict):
+        return {k: _floats(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_floats(v) for v in x]
+    return float(x) if isinstance(x, int) and not isinstance(x, bool) else x
 
 
 def reference_path(config: Config) -> Path:
@@ -242,6 +251,7 @@ if __name__ == "__main__":
     region.add_argument("--out-dir")
     region.add_argument("--tag", help="output file prefix (default: the region)")
     ref = sub.add_parser("reference", help="compute and cache baseline scores for a configuration")
+    ref.add_argument("--force", action="store_true", help="recompute even if already cached")
     ref.add_argument("--config", default=None)
     ref.add_argument("--ramp-rate", type=float, help="override battery.ramp_rate_mw_per_min")
     args = parser.parse_args()
@@ -255,4 +265,7 @@ if __name__ == "__main__":
         if args.ramp_rate is not None:
             config = dataclasses.replace(config, battery=dataclasses.replace(config.battery, ramp_rate_mw_per_min=args.ramp_rate))
         print(f"config {config_fingerprint(config)}", flush=True)
-        compute_reference(config)
+        if reference_path(config).exists() and not args.force:
+            print(f"Already cached: {reference_path(config)} (use --force to recompute)")
+        else:
+            compute_reference(config)

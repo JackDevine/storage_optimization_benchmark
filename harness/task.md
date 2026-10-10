@@ -18,7 +18,11 @@ for 3-day horizons specifically.
 - **Price-taker:** the battery is small enough that it never moves the price. Each interval, your bid is cleared
   against the actual dispatch price, the regional reference price (RRP), and revenue is MW × 5/60 h × RRP.
   Settlement is every 5 minutes. Prices range from the market floor of -$1,000/MWh to the cap of $23,200/MWh.
-- **Dispatch path:** {dispatch_rule}
+- **Dispatch path:** a dispatch target is the MW the battery must reach by the **end** of the interval. It moves in a
+  straight line from where it was at the start (`obs.last_mw`) to the target, and that path is what's settled. Energy
+  is the area under it, e.g. 0 → 0.5 MW delivers (0 + 0.5)/2 × 5/60 = 0.0208 MWh. If the path crosses zero, the
+  discharge and charge parts each get their own efficiency. SOC limits are checked along the path, including at the
+  zero crossing. See `bess.sim.settle_trajectory`.
 - **Energy only.** No FCAS.
 
 ## Bids: AEMO's bidirectional unit (BDU) format

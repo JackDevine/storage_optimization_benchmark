@@ -19,6 +19,8 @@
     --series-1: #2a78d6;
     --series-2: #eb6834;
     --series-3: #1baf7a;
+    --series-4: #eda100;
+    --series-5: #e87ba4;
     --good: #0ca30c;
     --critical: #d03b3b;
     --warning: #fab219;
@@ -38,6 +40,8 @@
       --series-1: #3987e5;
       --series-2: #d95926;
       --series-3: #199e70;
+      --series-4: #c98500;
+      --series-5: #d55181;
       --wash: rgba(57, 135, 229, 0.12);
     }
   }
@@ -54,6 +58,8 @@
     --series-1: #3987e5;
     --series-2: #d95926;
     --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
     --wash: rgba(57, 135, 229, 0.12);
   }
   * { box-sizing: border-box; }
@@ -139,6 +145,7 @@
     <button data-step="1440" aria-label="Forward 1 day">1d ▶▶</button>
     <button id="play" aria-label="Play">Play</button>
     <input type="range" id="slider" min="0" step="1" aria-label="Scrub time">
+    <label>Price axis <select id="price-scale"><option value="symlog" selected>Symlog</option><option value="linear">Linear</option></select></label>
     <label><input type="checkbox" id="clip" checked> Clip price spikes</label>
     <label>Episode <select id="episode"><option value="">jump to…</option></select></label>
     <span class="muted" style="font-size:12px">← → 5 min · Shift 1 h</span>
@@ -180,6 +187,32 @@
     </div>
     <div id="progress" style="width:100%;height:300px"></div>
     <div class="muted" id="progress-note" style="font-size:12px"></div>
+  </section>
+
+  <section class="card" style="margin-top:12px" aria-label="Compare runs">
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">Compare runs: best holdout episode score so far</h2>
+      <div class="row">
+        <label>Against
+          <select id="compare-x">
+            <option value="wall_s">Wall time</option>
+            <option value="active_s" selected>Active model time</option>
+            <option value="cost_usd">API-equivalent cost</option>
+            <option value="output_tokens">Output tokens</option>
+            <option value="total_tokens">Total tokens</option>
+          </select>
+        </label>
+        <label>Score
+          <select id="compare-y">
+            <option value="net_revenue">Net revenue ($)</option>
+            <option value="pct">% of perfect foresight</option>
+          </select>
+        </label>
+        <label><input type="checkbox" id="compare-old"> Include runs under old rules</label>
+      </div>
+    </div>
+    <div id="compare" style="width:100%;height:340px"></div>
+    <div class="muted" id="compare-note" style="font-size:12px"></div>
   </section>
 
   <div class="bottom">
@@ -244,9 +277,19 @@ function priceRange(values) {
   return [Math.min(-50, q(0.02) * 1.2), Math.max(200, q(0.98) * 1.3)];
 }
 
+// Symmetric log price axis: linear within ±SYMLOG_C $/MWh, logarithmic beyond, so
+// negative prices, ordinary prices and spikes to the cap all stay readable.
+// Plotly has no symlog axis, so the y values are transformed and the ticks relabelled.
+const SYMLOG_C = 10;
+const symlog = (v) => v == null ? null : Math.sign(v) * Math.log10(1 + Math.abs(v) / SYMLOG_C);
+const SYMLOG_TICKS = [-1000, -300, -100, -30, 0, 30, 100, 300, 1000, 3000, 10000, 23200];
+
 function drawChart(market, disp) {
+  const logScale = $("price-scale").value === "symlog";
+  $("clip").disabled = logScale;  // spikes fit on the symlog axis
   const tau = state.tauMs;
   const x0 = plotT(tau - 12 * 3600e3), x1 = plotT(tau + 30 * 3600e3);
+  const priceY = (ys) => logScale ? ys.map(symlog) : ys;
   const traces = [
     // keep every panel's axis drawn even before it has data
     { x: [x0], y: [null], yaxis: "y2", showlegend: false, hoverinfo: "skip" },
@@ -254,12 +297,12 @@ function drawChart(market, disp) {
   ];
   // Colour follows the entity across all panels: actual price = neutral ink, forecasts = orange / aqua,
   // the agent = blue, perfect foresight = muted grey reference.
-  traces.push({ name: "Actual price", x: market.actual.t, y: market.actual.rrp, type: "scatter", mode: "lines",
-    line: { color: css("--text-primary"), width: 2, shape: "hv" }, yaxis: "y", hovertemplate: "$%{y:,.0f}/MWh" });
-  if (market.p5min) traces.push({ name: "P5MIN forecast", x: market.p5min.t, y: market.p5min.rrp, mode: "lines",
-    line: { color: css("--series-2"), width: 2, dash: "dot", shape: "hv" }, yaxis: "y", hovertemplate: "$%{y:,.0f}/MWh" });
-  if (market.predispatch) traces.push({ name: "Predispatch forecast", x: market.predispatch.t, y: market.predispatch.rrp, mode: "lines",
-    line: { color: css("--series-3"), width: 2, dash: "dash", shape: "vh" }, yaxis: "y", hovertemplate: "$%{y:,.0f}/MWh" });
+  traces.push({ name: "Actual price", x: market.actual.t, y: priceY(market.actual.rrp), customdata: market.actual.rrp, type: "scatter", mode: "lines",
+    line: { color: css("--text-primary"), width: 2, shape: "hv" }, yaxis: "y", hovertemplate: "$%{customdata:,.0f}/MWh" });
+  if (market.p5min) traces.push({ name: "P5MIN forecast", x: market.p5min.t, y: priceY(market.p5min.rrp), customdata: market.p5min.rrp, mode: "lines",
+    line: { color: css("--series-2"), width: 2, dash: "dot", shape: "hv" }, yaxis: "y", hovertemplate: "$%{customdata:,.0f}/MWh" });
+  if (market.predispatch) traces.push({ name: "Predispatch forecast", x: market.predispatch.t, y: priceY(market.predispatch.rrp), customdata: market.predispatch.rrp, mode: "lines",
+    line: { color: css("--series-3"), width: 2, dash: "dash", shape: "vh" }, yaxis: "y", hovertemplate: "$%{customdata:,.0f}/MWh" });
 
   traces.push({ name: "Perfect foresight SOC", x: market.perfect_foresight.t, y: market.perfect_foresight.soc, mode: "lines",
     line: { color: css("--text-muted"), width: 2 }, yaxis: "y2", hovertemplate: "%{y:.2f} MWh" });
@@ -279,14 +322,18 @@ function drawChart(market, disp) {
       marker: { color: css("--critical"), size: 9, symbol: "x" }, hovertemplate: "%{text}" });
   }
 
-  const priceVals = traces.filter((t) => t.yaxis === "y").flatMap((t) => t.y);
+  const priceVals = traces.filter((t) => t.yaxis === "y").flatMap((t) => t.customdata || []);
+  const priceAxis = logScale
+    ? { range: [symlog(Math.min(-100, ...priceVals.filter((v) => v != null))) - 0.1, symlog(Math.max(1000, ...priceVals.filter((v) => v != null))) + 0.1],
+        tickvals: SYMLOG_TICKS.map(symlog), ticktext: SYMLOG_TICKS.map((v) => v.toLocaleString()), zeroline: true }
+    : { range: $("clip").checked ? priceRange(priceVals) : undefined, autorange: !$("clip").checked };
   const layout = {
     paper_bgcolor: css("--surface-1"), plot_bgcolor: css("--surface-1"), font: { color: css("--text-primary"), family: "system-ui, sans-serif" },
     margin: { l: 64, r: 16, t: 8, b: 36 }, hovermode: "x unified", bargap: 0,
     hoverlabel: { bgcolor: css("--surface-1"), bordercolor: css("--axis"), font: { color: css("--text-primary") } },
     legend: { orientation: "h", y: -0.06, font: { color: css("--text-secondary"), size: 12 } },
     xaxis: axisStyle({ range: [x0, x1], type: "date", anchor: "y3" }),
-    yaxis: axisStyle({ domain: [0.46, 1], title: { text: "Price ($/MWh)" }, range: $("clip").checked ? priceRange(priceVals) : undefined, autorange: !$("clip").checked }),
+    yaxis: axisStyle({ domain: [0.46, 1], title: { text: logScale ? "Price ($/MWh, symlog)" : "Price ($/MWh)" }, ...priceAxis }),
     yaxis2: axisStyle({ domain: [0.2, 0.42], title: { text: "Stored (MWh)" }, range: [0, 2] }),
     yaxis3: axisStyle({ domain: [0, 0.16], title: { text: "MW" }, range: [-1.1, 1.1] }),
     shapes: [
@@ -425,6 +472,85 @@ function drawProgress(s) {
       ". Scores are on the sampled holdout episodes. Invalid submissions earn no credit and sit at zero." +
       (ff ? (yKey === "pct" ? " The diamond is the final submission scored on the full month." : " Switch to % to compare with the full-month final score.") : "")
     : "No scored submissions yet.";
+}
+
+// ---------- compare runs ----------
+
+// Colour follows the model family, in a fixed order; repeat runs of a model get a different dash.
+const MODEL_COLOURS = [["opus", "--series-1"], ["sonnet", "--series-2"], ["haiku", "--series-3"], ["fable", "--series-4"]];
+const DASHES = ["solid", "dash", "dot", "dashdot"];
+const modelFamily = (m) => (MODEL_COLOURS.find(([k]) => (m || "").includes(k)) || ["other", "--series-5"]);
+const modelName = (m) => (m || "?").replace(/^claude-/, "").replace(/-(\d+)-(\d+)$/, " $1.$2").replace(/^./, (c) => c.toUpperCase());
+
+function drawCompare(data) {
+  if (!data) return;
+  const xKey = $("compare-x").value, yKey = $("compare-y").value, ax = X_AXES[xKey];
+  const yOf = (sub) => yKey === "pct" ? sub.pct_of_perfect : sub.net_revenue;
+  const runs = data.runs.filter((r) => r.comparable || $("compare-old").checked).slice().reverse();  // oldest first
+  const seen = {}, traces = [], annotations = [], shapes = [], ys = [0], xs = [0];
+  for (const r of runs) {
+    const [family, token] = modelFamily(r.model), colour = css(token);
+    const dash = DASHES[(seen[family] = (seen[family] ?? -1) + 1) % DASHES.length];
+    const label = `${modelName(r.model)} · ${r.run_id.slice(9, 11)}:${r.run_id.slice(11, 13)}` + (r.comparable ? "" : " (old rules)") + (r.running ? " (running)" : "");
+    const xOf = (sub) => sub.x[xKey] * ax.scale, endX = r.now_x[xKey] * ax.scale;
+    const done = r.submissions.filter((x) => x.state === "done" && x.x);
+    const valid = done.filter((x) => x.valid && yOf(x) != null).sort((a, b) => xOf(a) - xOf(b));
+    // Best valid score so far: zero until the first valid submission, then a rising step to the run's end.
+    const bx = [0], by = [0];
+    let best = null;
+    for (const sub of valid) {
+      if (best === null || yOf(sub) > best) { bx.push(xOf(sub), xOf(sub)); by.push(best ?? 0, yOf(sub)); best = yOf(sub); }
+    }
+    bx.push(Math.max(endX, bx[bx.length - 1])); by.push(best ?? 0);
+    xs.push(...bx); ys.push(...by);
+    traces.push({ name: label, legendgroup: r.run_id, x: bx, y: by, mode: "lines",
+      line: { color: colour, width: r.comparable ? 3 : 2, dash: r.comparable ? dash : "dot" }, hoverinfo: "skip" });
+    traces.push({ name: label, legendgroup: r.run_id, showlegend: false, x: valid.map(xOf), y: valid.map(yOf), mode: "markers",
+      marker: { size: 9, color: css("--surface-1"), line: { color: colour, width: 2 } },
+      hovertext: valid.map((sub) => `${label}<br>#${sub.n} · ${yKey === "pct" ? pct(sub.pct_of_perfect) : money(sub.net_revenue)}<br>${ax.fmt(sub.x[xKey])}<br>${(sub.summary || "").slice(0, 90)}`),
+      hoverinfo: "text" });
+    const invalid = done.filter((x) => !x.valid);
+    if (invalid.length) traces.push({ name: label, legendgroup: r.run_id, showlegend: false, x: invalid.map(xOf), y: invalid.map(() => 0), mode: "markers",
+      marker: { size: 10, symbol: "x-thin-open", line: { width: 2, color: css("--critical") } },
+      hovertext: invalid.map((sub) => `${label}<br>#${sub.n} · invalid (no credit)`), hoverinfo: "text" });
+    const ff = r.final_full_month;
+    if (ff && ff.pct_of_perfect != null && yKey === "pct") {
+      traces.push({ name: label, legendgroup: r.run_id, showlegend: false, x: [endX], y: [ff.pct_of_perfect], mode: "markers",
+        marker: { size: 12, symbol: "diamond", color: colour, line: { color: css("--surface-1"), width: 2 } },
+        hovertext: [`${label}<br>Full month, #${ff.n}: ${pct(ff.pct_of_perfect)}`], hoverinfo: "text" });
+      ys.push(ff.pct_of_perfect);
+    }
+    if (runs.length <= 4) annotations.push({ x: bx[bx.length - 1], y: best ?? 0, xanchor: "left", yanchor: "middle", showarrow: false, xshift: 6,
+      text: modelName(r.model), font: { color: css("--text-secondary"), size: 11 } });
+  }
+  const ref = runs.find((r) => r.comparable) || runs[0];
+  const baseline = ref && (yKey === "pct" ? ref.baseline_holdout_pct : ref.baseline_holdout_net_revenue);
+  if (baseline != null) {
+    ys.push(baseline);
+    shapes.push({ type: "line", xref: "paper", x0: 0, x1: 1, y0: baseline, y1: baseline, line: { color: css("--text-muted"), width: 1, dash: "dash" } });
+    annotations.push({ xref: "paper", x: 0, y: baseline, yanchor: "bottom", xanchor: "left", showarrow: false,
+      text: `baseline ${yKey === "pct" ? pct(baseline) : money(baseline)}`, font: { color: css("--text-muted"), size: 11 } });
+  }
+  Plotly.react("compare", traces, {
+    paper_bgcolor: css("--surface-1"), plot_bgcolor: css("--surface-1"), font: { color: css("--text-primary"), family: "system-ui, sans-serif" },
+    margin: { l: 70, r: 80, t: 10, b: 44 }, showlegend: true,
+    legend: { orientation: "h", y: -0.2, font: { color: css("--text-secondary"), size: 12 } },
+    hoverlabel: { bgcolor: css("--surface-1"), bordercolor: css("--axis"), font: { color: css("--text-primary") } },
+    xaxis: axisStyle({ title: { text: ax.title }, range: [0, Math.max(...xs) * 1.04 || 1], zeroline: false }),
+    yaxis: axisStyle({ title: { text: yKey === "pct" ? "% of perfect foresight" : "Net revenue, holdout episodes ($)" },
+      range: [Math.min(...ys) - 0.05 * Math.max(...ys), Math.max(...ys) * 1.12 || 1], tickprefix: yKey === "pct" ? "" : "$", ticksuffix: yKey === "pct" ? "%" : "" }),
+    shapes, annotations,
+  }, { displayModeBar: false, responsive: true });
+  const hidden = data.runs.length - runs.length;
+  $("compare-note").textContent = "Each line is a run's best valid holdout-episode score so far, up to the run's end (zero before its first valid submission). " +
+    "Circles are submissions; colour is the model." + (yKey === "pct" ? " Diamonds are the final submission scored on the full month." : "") +
+    (hidden ? ` ${hidden} run(s) under older market rules are hidden; their scores aren't comparable.` : "") +
+    ($("compare-old").checked && runs.some((r) => !r.comparable) ? " Dotted lines are runs under older rules, scored against a different baseline." : "");
+}
+
+async function pollCompare() {
+  try { state.compare = await api("/api/compare"); drawCompare(state.compare); }
+  catch (e) { $("compare-note").replaceChildren(el("span", { class: "error" }, String(e))); }
 }
 
 // ---------- data loading ----------
@@ -569,7 +695,9 @@ async function init() {
   $("run").addEventListener("change", (e) => { state.run = e.target.value; state.sub = ""; state.userPickedSub = false; $("submission").value = ""; pollRun(); refreshTime(); renderDetail(); });
   $("submission").addEventListener("change", (e) => { state.sub = e.target.value; refreshTime(); renderDetail(); if (state.status) renderStatus(state.status); });
   $("clip").addEventListener("change", refreshTime);
+  $("price-scale").addEventListener("change", refreshTime);
   ["progress-x", "progress-y"].forEach((id) => $(id).addEventListener("change", () => drawProgress(state.status)));
+  ["compare-x", "compare-y", "compare-old"].forEach((id) => $(id).addEventListener("change", () => drawCompare(state.compare)));
   $("slider").addEventListener("input", (e) => setTau(state.startMs + Number(e.target.value) * STEP_MS));
   document.querySelectorAll("[data-step]").forEach((b) => b.addEventListener("click", () => setTau(state.tauMs + Number(b.dataset.step) * 60e3)));
   $("play").addEventListener("click", () => {
@@ -593,6 +721,8 @@ async function init() {
   setTau(params.get("tau") ? parseT(params.get("tau")) : state.startMs + 4 * 3600e3);
   pollRun();
   setInterval(pollRun, 5000);
+  pollCompare();
+  setInterval(pollCompare, 15000);
   setInterval(async () => {   // pick up new runs
     const meta = await api("/api/meta");
     const sel = $("run"), cur = sel.value;

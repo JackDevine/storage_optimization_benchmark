@@ -7,19 +7,19 @@ Variables per step k: charge c_k, discharge d_k (MW), end-of-step energy e_k
     s.t. e_k = e_{k-1} + dt_k * (eta_c * c~_k - d~_k / eta_d)
          c_k <= P * u_k,   d_k <= P * (1 - u_k)
          0 <= c_k, d_k,   E_min <= e_k <= E_max
+         |(d_k - c_k) - (d_{k-1} - c_{k-1})| <= ramp * step minutes
          e_N + s >= E_target,   s >= 0          (only when penalty > 0)
 
-c~ and d~ are the step's average flows. By default the MW is held flat over a
-step, so c~_k = c_k. With `trajectory=True`, a 5-minute step follows AEMO's
-straight-line path from the previous step's MW to this step's target, so
-c~_k = (c_{k-1} + c_k) / 2 (the previous MW is `p_prev` for the first step).
-That matches the simulator exactly unless the step crosses zero, where it
-slightly overstates both flows; and the simulator also checks SOC at the zero
-crossing, which the MILP doesn't see. `soc_margin_mwh` keeps planned SOC that
-far inside its limits to absorb both (relaxed to the current SOC if the battery
-is already inside the margin). Longer (predispatch) steps stay flat. With
-`ramp_mw_per_min`, consecutive MW targets also differ by at most
-ramp × step length.
+c~ and d~ are the step's average flows. A 5-minute step follows AEMO's
+straight-line path from the previous step's MW to this step's end-of-interval
+target, so c~_k = (c_{k-1} + c_k) / 2 (the previous MW is `p_prev` for the
+first step). That matches the simulator exactly unless the step crosses zero,
+where it slightly overstates both flows; and the simulator also checks SOC at
+the zero crossing, which the MILP doesn't see. `soc_margin_mwh` keeps planned
+SOC that far inside its limits to absorb both (relaxed to the current SOC if
+the battery is already inside the margin). Longer (predispatch) steps are
+coarse planning steps, so their MW is held flat. Consecutive MW targets differ
+by at most the battery's ramp rate × step length.
 
 The binary stops the solver charging and discharging in the same step. Without
 it, an LP burns energy through round-trip losses at negative prices.
@@ -44,13 +44,11 @@ def solve_schedule(
     e0: float,
     terminal: TerminalCondition,
     mip_rel_gap: float = 1e-4,
-    p_prev: float | None = None,
-    trajectory: bool = False,
-    ramp_mw_per_min: float | None = None,
+    p_prev: float = 0.0,
     soc_margin_mwh: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (charge_mw, discharge_mw, energy_mwh) per step. `p_prev` is the
-    unit's MW now (+ = discharge), where the first step starts."""
+    unit's MW now (+ = discharge), where the first step's straight line starts."""
     n = len(prices)
     p, dt, b = np.asarray(prices, float), np.asarray(dt_hours, float), battery
     inf = highspy.kHighsInf
@@ -58,11 +56,12 @@ def solve_schedule(
     k = np.arange(n)
     C, D, E, U = 0, n, 2 * n, 3 * n  # column offsets
     num_col = 4 * n + int(soft_terminal)
-    prev = 0.0 if p_prev is None else float(p_prev)
+    prev = float(p_prev)
     c_prev, d_prev = max(-prev, 0.0), max(prev, 0.0)
 
-    # Weight on the previous step's MW in each step's average flow.
-    w = np.where(trajectory & (dt <= FIVE_MIN_H + 1e-9), 0.5, 0.0)
+    # Weight on the previous step's MW in each step's average flow: half on
+    # 5-minute (straight-line) steps, none on longer flat steps.
+    w = np.where(dt <= FIVE_MIN_H + 1e-9, 0.5, 0.0)
     own = dt * (1 - w)  # each step's MW, in its own step
     nxt = np.append(dt[1:] * w[1:], 0.0)  # each step's MW, in the following step
 
@@ -102,18 +101,17 @@ def solve_schedule(
     first = e0 - dt[0] * w[0] * (d_prev / b.discharge_eff - b.charge_eff * c_prev)
     row_lower[0] = row_upper[0] = first
 
-    if ramp_mw_per_min is not None:
-        # Row 3n+k: (d_k - c_k) - (d_{k-1} - c_{k-1}) within ±ramp × step minutes.
-        step = ramp_mw_per_min * dt * 60
-        r = 3 * n + k
-        rows += [r, r, r[1:], r[1:]]
-        cols += [D + k, C + k, D + k[:-1], C + k[:-1]]
-        vals += [np.ones(n), -np.ones(n), -np.ones(n - 1), np.ones(n - 1)]
-        lo, hi = -step, step.copy()
-        lo[0] += prev
-        hi[0] += prev
-        row_lower = np.concatenate([row_lower, lo])
-        row_upper = np.concatenate([row_upper, hi])
+    # Rows 3n..4n-1, ramp: (d_k - c_k) - (d_{k-1} - c_{k-1}) within ±ramp × step minutes.
+    step = b.ramp_rate_mw_per_min * dt * 60
+    r = 3 * n + k
+    rows += [r, r, r[1:], r[1:]]
+    cols += [D + k, C + k, D + k[:-1], C + k[:-1]]
+    vals += [np.ones(n), -np.ones(n), -np.ones(n - 1), np.ones(n - 1)]
+    lo, hi = -step, step.copy()
+    lo[0] += prev
+    hi[0] += prev
+    row_lower = np.concatenate([row_lower, lo])
+    row_upper = np.concatenate([row_upper, hi])
 
     if soft_terminal:
         # Last row: e_{N-1} + s >= E_target, with shortfall s penalised.

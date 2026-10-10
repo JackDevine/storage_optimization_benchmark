@@ -29,8 +29,9 @@ from bess.bid import bid_from_dict, dispatch_at_price, effective_gen_mw, effecti
 from bess.config import load_config
 from bess.data import load_region
 from bess.policies import PerfectForesight
+from bess.remote import config_from_dict
 from bess.sim import simulate
-from harness.evaluator import REFERENCE_PATH
+from harness.evaluator import REFERENCE_DIR, REFERENCE_PATH, SIM_VERSION, config_fingerprint
 from harness.run_agent import CONFIG_PATH, RUNS_DIR
 from harness.splits import HOLDOUT_END, HOLDOUT_EPISODES, HOLDOUT_START, REGIONS
 
@@ -49,17 +50,47 @@ def _clean(values) -> list:
     return [None if not np.isfinite(v) else round(float(v), 4) for v in values]
 
 
-@lru_cache(maxsize=None)
-def region_data(region: str):
-    with _lock:
-        return load_region(region)
+PF_CACHE_DIR = REFERENCE_DIR.parent / "dashboard_cache"
 
 
-@lru_cache(maxsize=None)
+def _cached_per_region(build):
+    """Memoise `build(region)`, computing each region once even when several
+    requests (or the warm-up thread) ask at the same time. Per-region locks, so
+    loading one region never blocks requests for another, or for run data."""
+    values, locks = {}, {r: threading.Lock() for r in REGIONS}
+
+    def get(region: str):
+        with locks[region]:
+            if region not in values:
+                values[region] = build(region)
+            return values[region]
+
+    return get
+
+
+region_data = _cached_per_region(load_region)
+
+
+@_cached_per_region
 def perfect_foresight(region: str) -> pd.DataFrame:
+    """Perfect-foresight SOC over the holdout month: a month-long MILP solve
+    (several seconds), so it's cached on disk per config fingerprint."""
+    path = PF_CACHE_DIR / f"pf_{config_fingerprint(CONFIG)}_{region}.parquet"
+    if path.exists():
+        return pd.read_parquet(path)
     data = region_data(region)
     policy = PerfectForesight(CONFIG, data.actual_rrp, HOLDOUT_START, HOLDOUT_END)
-    return simulate(policy, data, CONFIG, HOLDOUT_START, HOLDOUT_END).set_index("interval_end")
+    pf = simulate(policy, data, CONFIG, HOLDOUT_START, HOLDOUT_END).set_index("interval_end")[["energy_end_mwh"]]
+    PF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    pf.to_parquet(path)
+    return pf
+
+
+def warm_up() -> None:
+    """Load every region in the background, so switching region doesn't stall."""
+    for region in REGIONS:
+        region_data(region)
+        perfect_foresight(region)
 
 
 def market(region: str, tau: pd.Timestamp) -> dict:
@@ -250,6 +281,26 @@ def run_status(run_id: str) -> dict:
     }
 
 
+def compare_runs() -> dict:
+    """Every run's submissions, for the cross-run comparison chart. A run is
+    comparable when it was scored under the current config and simulator
+    (same fingerprint); older runs used different market rules."""
+    current = config_fingerprint(CONFIG)
+    runs = []
+    for run_id in list_runs():
+        s = run_status(run_id)
+        ref_path = RUNS_DIR / run_id / "reference.json"
+        ref = json.loads(ref_path.read_text()) if ref_path.exists() else {}
+        same_sim = ref.get("sim_version") == SIM_VERSION and "config" in ref
+        fingerprint = config_fingerprint(config_from_dict(ref["config"])) if same_sim else None
+        runs.append({
+            "run_id": run_id, "model": s["model"], "running": s["running"], "comparable": fingerprint == current,
+            **{k: s[k] for k in ("submissions", "now_x", "axes_frozen", "final_full_month",
+                                 "baseline_holdout_pct", "baseline_holdout_net_revenue", "baseline_full_month_pct")},
+        })
+    return {"fingerprint": current, "runs": runs}
+
+
 TOKEN_KEYS = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
 
 
@@ -367,6 +418,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = market(q["region"], pd.Timestamp(q["tau"]))
             elif url.path == "/api/run":
                 body = run_status(q["id"])
+            elif url.path == "/api/compare":
+                body = compare_runs()
             elif url.path == "/api/narrative":
                 body = narrative(q["id"], int(q["n"]))
             elif url.path == "/api/policy":
@@ -384,6 +437,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8050)
     args = parser.parse_args()
+    threading.Thread(target=warm_up, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"Dashboard: http://127.0.0.1:{args.port}")
     server.serve_forever()

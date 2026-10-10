@@ -92,17 +92,6 @@ class Policy:
         return setpoint_bid(0.0, self.config.battery, self.config.market)
 '''
 
-DISPATCH_RULES = {
-    True: (
-        "a dispatch target is the MW the battery must reach by the **end** of the interval. It moves in a straight\n"
-        "  line from where it was at the start (`obs.last_mw`) to the target, and that path is what's settled. Energy\n"
-        "  is the area under it, e.g. 0 → 0.5 MW delivers (0 + 0.5)/2 × 5/60 = 0.0208 MWh. If the path crosses zero,\n"
-        "  the discharge and charge parts each get their own efficiency. SOC limits are checked along the path,\n"
-        "  including at the zero crossing. See `bess.sim.settle_trajectory`."
-    ),
-    False: "the cleared MW is held flat for the whole interval, so energy = MW × 5/60.",
-}
-
 AGENT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "TodoWrite"]
 SNAPSHOT_IGNORE = shutil.ignore_patterns("data", "dev_results", "__pycache__", ".*", "*.parquet")
 MAX_SNAPSHOT_BYTES = 200 * 1024 * 1024
@@ -192,6 +181,7 @@ class Run:
         self.limit_deferred = False
         self.rate_limited = False
         self.rate_limit_resets_at: float | None = None
+        self.access_error: str | None = None  # the account can't use this model at all
 
     # ---- setup ----
 
@@ -221,7 +211,6 @@ class Run:
             baseline_dev_episodes_pct=self.reference["dev_episodes"]["pct_of_perfect"],
             n_episodes=len(HOLDOUT_EPISODES),
             ramp_rate=self.config.battery.ramp_rate_mw_per_min,
-            dispatch_rule=DISPATCH_RULES[self.config.market.linear_dispatch_trajectory],
         )
         (self.workspace / "TASK.md").write_text(task)
         self.submissions_dir.mkdir()
@@ -483,11 +472,15 @@ class Run:
                 raw = getattr(info, "raw", None) or (info if isinstance(info, dict) else {})
                 windows = raw.get("unifiedWindows", {}) if isinstance(raw, dict) else {}
                 status = getattr(info, "status", None)
-                if status == "rejected":
+                error_code = raw.get("errorCode") if isinstance(raw, dict) else None
+                if status == "rejected" and error_code == "credits_required":
+                    # Not a limit that resets: this model needs paid usage credits on this account.
+                    self.access_error = f"{self.model} requires usage credits on this subscription (credits_required)"
+                elif status == "rejected":
                     self.rate_limited = True
                     self.rate_limit_resets_at = getattr(info, "resets_at", None)
                 self.log.event(
-                    "rate_limit", status=status, limit_type=getattr(info, "rate_limit_type", None),
+                    "rate_limit", status=status, error_code=error_code, limit_type=getattr(info, "rate_limit_type", None),
                     resets_at=getattr(info, "resets_at", None),
                     utilization={k: v.get("utilization") for k, v in windows.items()},
                 )
@@ -518,7 +511,7 @@ class Run:
 
     def check_limits(self) -> str | None:
         if self.active_seconds() > self.args.max_hours * 3600:
-            return "wall_time"
+            return "active_time"  # the time budget excludes usage-limit pauses and submission scoring
         if self.cost_usd() > self.args.max_cost:
             return "cost"
         return None
@@ -666,6 +659,11 @@ class Run:
                     await client.query(prompt)
                     async for message in client.receive_response():
                         self.handle(message)
+                    if self.access_error:
+                        self.finished_reason = "no_model_access"
+                        self.log.event("no_model_access", detail=self.access_error)
+                        print(f"Stopping: {self.access_error}.", flush=True)
+                        return "finished"
                     if self.finished_reason:
                         return "finished"
                     if self.limit_reason:
