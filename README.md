@@ -82,7 +82,8 @@ by (config, policy, region), where config is the config file's name.
 - `bess/bid.py`: the BDU bid, following AEMO's IESS format.
   - Each side (LOAD and GEN) has 10 price bands fixed for the trading day.
   - Each interval also sets MW per band, MaxAvail and ramp rates. The ramp rates must equal the unit's configured
-    rate (`battery.ramp_rate_mw_per_min`, or `run_agent.py --ramp-rate`); any other value gets the bid rejected.
+    rate (`battery.ramp_rate_mw_per_min`, or `run_agent.py --ramp-rate`); a bid with any other value is still
+    dispatched at the unit's rate but flagged as bid non-conformance, which makes the run invalid.
   - Validation follows AEMO's rules: prices strictly increase within each side, prices stay between the floor and
     cap scaled by MLF, and the effective bands pass the convexity check, so a bid can never charge and discharge
     at once.
@@ -117,11 +118,29 @@ by (config, policy, region), where config is the config file's name.
 claude setup-token        # once; save the token to ~/.config/storage-benchmark/claude_oauth_token
 uv run python -m harness.evaluator reference      # once; caches baseline dev/holdout scores
 uv run python -m harness.run_agent --model claude-sonnet-5-5 --max-hours 2 --max-cost 20
+uv run python -m harness.run_agent --model openai/gpt-5.1 --max-hours 2 --max-cost 20   # any OpenRouter slug
 uv run python -m harness.dashboard                 # live view at http://127.0.0.1:8050
+MODELS="claude-opus-5-5 google/gemini-3-pro" scripts/run_sweep.sh   # several models, one after another
 ```
 
-A model is asked to write a bidding policy. `harness/run_agent.py` drives Claude Code through the Claude Agent SDK
-on your Claude subscription. Costs are reported as what the tokens would cost at standard API rates.
+A model is asked to write a bidding policy. There are two backends, picked by the model name:
+
+- **Claude models** (`claude-…`): `harness/run_agent.py` drives Claude Code through the Claude Agent SDK on your
+  Claude subscription. Costs are reported as what the tokens would cost at standard API rates.
+- **OpenRouter slugs** (`vendor/model`): `harness/openrouter_agent.py` is the harness's own agent loop over
+  OpenRouter's chat completions API. Save your key to `~/.config/storage-benchmark/openrouter_api_key` (or export
+  `OPENROUTER_API_KEY`).
+  - **The cost is real.** It's what OpenRouter bills, from each response's `usage.cost`, and `--max-cost`
+    (default $20) is a spending cap, checked before every API call.
+  - The model must support tool calling. The harness checks this, and the key, before a run starts.
+  - It gets the same brief, workspace and harness tools as the Claude runs. Its workspace tools are its own:
+    `bash` (one command per call, no network), `read_file`, `write_file` and `edit_file`, with a short system
+    prompt (`harness/openrouter_system.md`) instead of Claude Code's. **That's a different scaffold**, so keep it
+    in mind when comparing with Claude Code runs. Running an `anthropic/claude-…` slug through the same loop is
+    the control for that.
+  - `--effort` becomes OpenRouter's `reasoning.effort`. Each response's reasoning (`reasoning_details`) is passed
+    back unmodified on later calls.
+  - When the prompt nears the model's context window, the oldest tool outputs are elided.
 
 - **Split** (`harness/splits.py`): the agent develops on June–July 2026 (`data/dev.duckdb`, exported from the main
   DB with only what was published by the end of July). It's scored on August 2026, all five regions.
@@ -137,7 +156,8 @@ on your Claude subscription. Costs are reported as what the tokens would cost at
   `Policy(config, region).decide(obs) -> BDUBid`. `obs` is a `bess.observation.Observation` holding the latest
   P5MIN and predispatch runs, past actual prices and the battery state.
 - **Agent tools:**
-  - Claude Code's Bash, Read, Write, Edit, Glob, Grep and TodoWrite.
+  - Claude: Claude Code's Bash, Read, Write, Edit, Glob, Grep and TodoWrite. OpenRouter: `bash`, `read_file`,
+    `write_file`, `edit_file`.
   - `python -m harness.dev_eval` to score its policy on dev data.
   - `submit_policy`, which scores on the holdout episodes and returns only the aggregate % of perfect foresight,
     validity and the baseline's score on the same episodes. The default is 5 submissions, and the final score is the last valid one.
@@ -145,23 +165,33 @@ on your Claude subscription. Costs are reported as what the tokens would cost at
 - **Isolation:**
   - The CLI runs in bubblewrap (`harness/sandbox.py`) with a read-only filesystem and the home directory and
     `/tmp` hidden. The full database, earlier runs and your Claude Code config aren't visible.
-  - The agent's bash commands also run in Claude Code's sandbox with no network.
+  - The agent's bash commands also run in Claude Code's sandbox with no network. For OpenRouter runs, each bash
+    command runs in bubblewrap with no network, with the workspace and a per-run `/tmp` (kept between commands)
+    as the only writable paths, and the file tools only reach the workspace (reads may also reach
+    `bess/` and `harness/`), with symlinks resolved first.
+  - The policy and OpenRouter bash sandboxes start with an empty environment, so API keys and tokens never reach
+    agent code.
   - At holdout time the policy runs in its own sandboxed process with no network (`bess/remote.py`) and only
     receives observations, so it can't read actual prices from the simulator.
 - **Interruptions:**
   - **Usage limit:** the run pauses until the reported reset time, then resumes the same Claude Code session with
-    its full context. `--max-hours` counts active time only, which excludes these pauses and the time spent scoring submissions.
+    its full context. For OpenRouter, rate limits and provider errors are retried with backoff, with the clock
+    stopped, and running out of credits ends the run (`ended_by: no_credits`). `--max-hours` counts active time only, which excludes these pauses and the time spent scoring submissions.
   - **CLI crash or dropped connection:** the harness retries with backoff.
   - **Harness process stopped** (reboot, Ctrl-C, or a limit longer than `--max-pause-hours`): run
     `uv run python -m harness.run_agent --resume <run_id>`. It rebuilds state from `state.json`, the event log and
     `submissions/`, and re-scores any submission whose evaluation was cut off.
   - **Time or cost cap during a submission:** the evaluation finishes and is recorded before the run stops.
+  - **Scoring failure:** a scoring job that dies with no output (killed from outside, not a policy crash) is
+    retried once. If scoring itself fails, the submission isn't counted and the agent is told it can resubmit.
 - **Logs** (`runs/<run_id>/`):
   - `logs/events.jsonl`: every API call (tokens, API-equivalent cost, latency, thinking summaries), every tool
     call (duration, sizes), submissions, nudges and limits.
-  - `logs/transcript.jsonl`: every message in full.
+  - `logs/transcript.jsonl`: every message in full (OpenRouter: every raw response).
+  - `logs/messages.jsonl` (OpenRouter): the conversation, which `--resume` reloads.
   - `submissions/NN/`: the snapshot, evaluation outputs and `result.json` for each submission.
-  - `summary.json`: totals and the final score.
+  - `summary.json`: totals and the final score. `cost_usd` is the API-equivalent cost for Claude runs and the
+    billed cost for OpenRouter runs (`billing` says which).
 - **Dashboard** (`harness/dashboard.py` + `dashboard.html`): scrubs through the holdout month.
   - Price panel: actual prices up to the scrub time, plus the P5MIN and predispatch runs that were current then.
   - Once a submission has been scored, the panels beneath show its state of charge (against perfect foresight's)

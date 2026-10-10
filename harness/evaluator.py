@@ -104,19 +104,24 @@ def evaluate(
             cmd.append("--no-sandbox")
         if out_dir:
             cmd += ["--out-dir", str(out_dir)]
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            start_new_session=True, cwd=PROJECT_ROOT,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.communicate()
-            return {**meta, "error": f"timed out after {timeout_s:.0f}s"}
-        if proc.returncode != 0:
-            return {**meta, "error": (stderr or stdout)[-2000:]}
-        return {**json.loads(stdout.strip().splitlines()[-1]), **meta}
+        # A job that dies without a word was killed from outside (a policy crash
+        # leaves a traceback), so it's retried once rather than charged to the policy.
+        for attempt in range(2):
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True, cwd=PROJECT_ROOT,
+            )
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate()
+                return {**meta, "error": f"timed out after {timeout_s:.0f}s"}
+            if proc.returncode == 0:
+                return {**json.loads(stdout.strip().splitlines()[-1]), **meta}
+            if (stderr or stdout).strip():
+                return {**meta, "error": (stderr or stdout)[-2000:]}
+        return {**meta, "error": f"the scoring process exited with code {proc.returncode} and no output, twice"}
 
     workers = max_workers or min(len(jobs), max(1, (os.cpu_count() or 2) - 2))
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -135,7 +140,8 @@ def aggregate(jobs: list[dict]) -> dict:
         return {
             "valid": False,
             "error": "; ".join(
-                f"{j['region']} episode {j['episode']}: {j['error'].strip().splitlines()[-1]}" for j in errors[:5]
+                f"{j['region']} episode {j['episode']}: {(j['error'].strip().splitlines() or ['no output'])[-1]}"
+                for j in errors[:5]
             ),
         }
 

@@ -295,6 +295,7 @@ def compare_runs() -> dict:
         fingerprint = config_fingerprint(config_from_dict(ref["config"])) if same_sim else None
         runs.append({
             "run_id": run_id, "model": s["model"], "running": s["running"], "comparable": fingerprint == current,
+            "started": next((e["t"] for e in run_events(run_id)), None),
             **{k: s[k] for k in ("submissions", "now_x", "axes_frozen", "final_full_month",
                                  "baseline_holdout_pct", "baseline_holdout_net_revenue", "baseline_full_month_pct")},
         })

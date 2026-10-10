@@ -1,20 +1,29 @@
 """Run a model as an agent that writes a battery bidding policy.
 
     uv run python -m harness.run_agent [--model claude-sonnet-5-5] [--max-hours 2] [--max-cost 20]
+    uv run python -m harness.run_agent --model openai/gpt-5.1      # any OpenRouter slug
 
-Drives Claude Code through the Claude Agent SDK on your Claude subscription.
-Create a token with `claude setup-token`, then either export it as
-CLAUDE_CODE_OAUTH_TOKEN or save it to ~/.config/storage-benchmark/claude_oauth_token. The agent works in a sandboxed
-workspace (harness/sandbox.py) holding the task brief (harness/task.md), the
-dev data and a starter policy. It can run `harness.dev_eval` itself and calls
-the `submit_policy` tool to have its policy scored on the holdout month.
+Two backends, picked by the model name:
+- Claude models (names in PRICES) run in Claude Code through the Claude Agent
+  SDK on your Claude subscription. Create a token with `claude setup-token`,
+  then either export it as CLAUDE_CODE_OAUTH_TOKEN or save it to
+  ~/.config/storage-benchmark/claude_oauth_token.
+- OpenRouter slugs (anything with a `/`, e.g. `google/gemini-3-pro`) run in
+  this harness's own agent loop (harness/openrouter_agent.py), billed to your
+  OpenRouter credits. Put the key in OPENROUTER_API_KEY or
+  ~/.config/storage-benchmark/openrouter_api_key.
+
+The agent works in a sandboxed workspace (harness/sandbox.py) holding the task
+brief (harness/task.md), the dev data and a starter policy. It can run
+`harness.dev_eval` itself and calls the `submit_policy` tool to have its policy
+scored on the holdout episodes.
 
 Runs survive interruptions without losing anything:
-- Hitting the subscription's usage limit pauses the run until the limit resets,
-  then resumes the same Claude Code session. --max-hours measures active time,
+- Hitting the subscription's usage limit (or, for OpenRouter, a rate limit or
+  provider error) pauses the run, then resumes the same conversation. --max-hours measures active time,
   which excludes these pauses and the time spent scoring submissions.
 - If the CLI crashes or the connection drops, the harness retries with
-  backoff and resumes the session.
+  backoff and resumes the conversation.
 - If the harness process itself stops (reboot, Ctrl-C, a weekly limit longer
   than --max-pause-hours), restart it with `--resume <run_id>`. It rebuilds its
   state from the run's logs and state.json; a submission whose evaluation was
@@ -25,12 +34,14 @@ Everything lands in runs/<run_id>/:
 - submissions/NN/        snapshot of each submitted policy, plus eval/ outputs and result.json
 - logs/events.jsonl      one JSON line per event: API calls (final tokens, API-equivalent cost, duration),
                          tool calls (duration, sizes), submissions, nudges, limits, result messages
-- logs/transcript.jsonl  every SDK message, in full
+- logs/transcript.jsonl  every SDK message (Claude) or raw API response (OpenRouter), in full
+- logs/messages.jsonl    OpenRouter only: the conversation, for resuming
 - state.json             resumable state: session id, active time, nudges, how the run ended
 - summary.json           totals and the final score
 
-Cost is what the tokens would cost at standard API rates. The run itself is
-billed to the subscription.
+For Claude runs, cost is what the tokens would cost at standard API rates; the
+run itself is billed to the subscription. For OpenRouter runs it's the real
+cost OpenRouter reports, and --max-cost (default $20) is a real spending cap.
 """
 
 import argparse
@@ -92,6 +103,18 @@ class Policy:
         return setpoint_bid(0.0, self.config.battery, self.config.market)
 '''
 
+# The harness tools, described the same way to every backend.
+SUBMIT_POLICY_DESCRIPTION = (
+    "Score the policy currently in the workspace (policy.py plus helper files) on the sampled holdout "
+    "episodes. Takes a few minutes. Limited submissions; your final submission is your last valid one, "
+    "and it is also scored on the whole holdout month after the run. "
+    "`summary`: a short description of what the policy does (how it forms bids, how it manages state "
+    "of charge). `rationale`: why you expect this approach to work, and what you changed since your "
+    "last submission and why."
+)
+STATUS_DESCRIPTION = "Show remaining time, model budget and submissions."
+FINISH_DESCRIPTION = "End the run. Call this when you are done."
+
 AGENT_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "TodoWrite"]
 SNAPSHOT_IGNORE = shutil.ignore_patterns("data", "dev_results", "__pycache__", ".*", "*.parquet")
 MAX_SNAPSHOT_BYTES = 200 * 1024 * 1024
@@ -127,17 +150,33 @@ class EventLog:
         self._events.flush()
 
     def transcript(self, message) -> None:
-        body = dataclasses.asdict(message) if dataclasses.is_dataclass(message) else repr(message)
-        record = {"t": time.time(), "type": type(message).__name__, "message": body}
+        if isinstance(message, dict):  # a raw API response
+            body = message
+        else:
+            body = dataclasses.asdict(message) if dataclasses.is_dataclass(message) else repr(message)
+        record = {"t": time.time(), "type": "api_response" if isinstance(message, dict) else type(message).__name__,
+                  "message": body}
         self._transcript.write(json.dumps(record, default=str) + "\n")
         self._transcript.flush()
 
 
+def is_openrouter(model: str) -> bool:
+    """OpenRouter slugs are `vendor/model`; Claude models on the subscription have no `/`."""
+    return "/" in model
+
+
 class Run:
+    """Everything shared by the agent backends: the workspace, submissions and
+    scoring, the time and cost budget, pausing and resuming, and the summary.
+    A backend supplies `session`, `interrupt`, `call_cost` and, for resuming,
+    `restore_conversation`."""
+
+    billing = "subscription"
+
     def __init__(self, args):
         self.args = args
         self.model = args.model
-        self.run_id = args.run_id or f"{datetime.now():%Y%m%d-%H%M%S}-{self.model}"
+        self.run_id = args.run_id or f"{datetime.now():%Y%m%d-%H%M%S}-{self.model.replace('/', '_')}"
         self.dir = RUNS_DIR / self.run_id
         self.workspace = self.dir / "workspace"
         self.submissions_dir = self.dir / "submissions"
@@ -214,12 +253,15 @@ class Run:
         )
         (self.workspace / "TASK.md").write_text(task)
         self.submissions_dir.mkdir()
-        (self.dir / "claude_config").mkdir()
 
     # ---- accounting ----
 
+    def call_cost(self, usage: dict) -> float:
+        """Cost of one API call from its usage record."""
+        raise NotImplementedError
+
     def cost_usd(self) -> float:
-        return sum(usage_cost(self.model, u) for u in self.api_calls.values())
+        return sum(self.call_cost(u) for u in self.api_calls.values())
 
     def token_totals(self) -> dict:
         keys = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
@@ -275,39 +317,13 @@ class Run:
             return "none (no valid submission yet)"
         return f"{final['result']['pct_of_perfect']:.1f}% of perfect foresight (submission {final['n']})"
 
-    # ---- tools ----
+    # ---- harness tools (shared by the backends) ----
 
-    def make_tools(self):
-        @tool(
-            "submit_policy",
-            "Score the policy currently in the workspace (policy.py plus helper files) on the sampled holdout "
-            "episodes. Takes a few minutes. Limited submissions; your final submission is your last valid one, "
-            "and it is also scored on the whole holdout month after the run. "
-            "`summary`: a short description of what the policy does (how it forms bids, how it manages state "
-            "of charge). `rationale`: why you expect this approach to work, and what you changed since your "
-            "last submission and why.",
-            {
-                "type": "object",
-                "properties": {"summary": {"type": "string"}, "rationale": {"type": "string"}},
-                "required": ["summary", "rationale"],
-            },
-        )
-        async def submit_policy(args):
-            text = await self.submit(args.get("summary", ""), args.get("rationale", ""))
-            return {"content": [{"type": "text", "text": text}]}
-
-        @tool("status", "Show remaining time, model budget and submissions.", {})
-        async def status(args):
-            return {"content": [{"type": "text", "text": self.status_text()}]}
-
-        @tool("finish", "End the run. Call this when you are done.", {"summary": str})
-        async def finish(args):
-            self.finished_reason = "agent_finished"
-            self.agent_summary = args.get("summary", "")
-            self.log.event("finish", summary=self.agent_summary)
-            return {"content": [{"type": "text", "text": f"Run finished. Final score: {self.final_score_text()}."}]}
-
-        return create_sdk_mcp_server(name="harness", tools=[submit_policy, status, finish])
+    def finish(self, summary: str) -> str:
+        self.finished_reason = "agent_finished"
+        self.agent_summary = summary
+        self.log.event("finish", summary=summary)
+        return f"Run finished. Final score: {self.final_score_text()}."
 
     async def submit(self, summary: str, rationale: str) -> str:
         if len(self.submissions) >= self.args.max_submissions:
@@ -317,6 +333,8 @@ class Run:
         n = len(self.submissions) + 1
         snap_dir = self.submissions_dir / f"{n:02d}"
         policy_dir = snap_dir / "policy"
+        if snap_dir.exists():  # left by a submission whose scoring crashed before it was recorded
+            shutil.rmtree(snap_dir)
         shutil.copytree(self.workspace, policy_dir, ignore=SNAPSHOT_IGNORE)
         size = sum(f.stat().st_size for f in policy_dir.rglob("*") if f.is_file())
         if size > MAX_SNAPSHOT_BYTES:
@@ -335,6 +353,14 @@ class Run:
         self.stop_clock()
         try:
             record = await self.evaluate_submission(n, summary, rationale)
+        except Exception as e:  # a harness fault, not the policy's: don't count it
+            self.log.event("submission_error", n=n, error=f"{type(e).__name__}: {e}")
+            shutil.rmtree(snap_dir, ignore_errors=True)
+            return (
+                f"The harness failed while scoring this submission ({type(e).__name__}: {e}). "
+                f"That's not a fault in your policy, and it doesn't count as a submission; you can submit again. "
+                + self.status_text()
+            )
         finally:
             self.evaluating = False
             if was_running:
@@ -389,126 +415,6 @@ class Run:
         lines.append(f"Evaluation took {record['eval_seconds'] / 60:.1f} min. {self.status_text()}")
         return "\n".join(lines)
 
-    # ---- hooks ----
-
-    async def pre_tool(self, hook_input, tool_use_id, context):
-        self.tool_starts[tool_use_id] = time.time()
-        self.log.event(
-            "tool_start", tool=hook_input["tool_name"], tool_use_id=tool_use_id,
-            input=_truncate(hook_input.get("tool_input"), 2000),
-        )
-        return {}
-
-    async def post_tool(self, hook_input, tool_use_id, context):
-        failed = hook_input["hook_event_name"] == "PostToolUseFailure"
-        duration = time.time() - self.tool_starts.pop(tool_use_id, time.time())
-        name = hook_input["tool_name"]
-        response = hook_input.get("tool_response", hook_input.get("error"))
-        stats = self.tool_stats.setdefault(name, {"calls": 0, "seconds": 0.0, "failures": 0})
-        stats["calls"] += 1
-        stats["seconds"] += duration
-        stats["failures"] += int(failed)
-        self.log.event(
-            "tool_end", tool=name, tool_use_id=tool_use_id, duration_s=round(duration, 3), failed=failed,
-            response_chars=len(json.dumps(response, default=str)), response=_truncate(response, 2000),
-        )
-        return {}
-
-    # ---- message handling ----
-
-    def handle(self, message) -> None:
-        now = time.time()
-        if isinstance(message, StreamEvent):
-            self.handle_stream_event(message.event, now)
-            return  # far too many to keep in the transcript
-        self.log.transcript(message)
-        session_id = getattr(message, "session_id", None) or (getattr(message, "data", None) or {}).get("session_id")
-        if session_id and session_id != self.session_id:
-            self.session_id = session_id
-            self.log.event("session", session_id=session_id)
-            self.save_state()
-        if isinstance(message, AssistantMessage):
-            if message.error == "rate_limit":
-                self.rate_limited = True
-            first_block = message.message_id not in self.api_calls
-            if message.usage and first_block:
-                # Placeholder: an assistant message's usage is captured at the start of the
-                # response. handle_stream_event replaces it with the final usage.
-                self.api_calls[message.message_id] = message.usage
-            blocks = []
-            for b in message.content:
-                if isinstance(b, TextBlock):
-                    blocks.append({"type": "text", "text": b.text})
-                elif isinstance(b, ThinkingBlock):
-                    blocks.append({"type": "thinking", "text": b.thinking})
-                elif isinstance(b, ToolUseBlock):
-                    blocks.append({"type": "tool_use", "name": b.name, "input": _truncate(b.input, 500)})
-            self.log.event(
-                "assistant_message", message_id=message.message_id, model=message.model,
-                new_api_call=first_block, latency_s=round(now - self.last_message_at, 3),
-                stop_reason=message.stop_reason, usage=message.usage,
-                call_cost_usd=usage_cost(self.model, message.usage or {}),
-                cumulative_cost_usd=self.cost_usd(), blocks=blocks, error=message.error,
-            )
-        elif isinstance(message, ResultMessage):
-            if message.api_error_status == 429:
-                self.rate_limited = True
-            self.result_messages += 1
-            self.sdk_cost_usd = message.total_cost_usd or self.sdk_cost_usd
-            self.sdk_model_usage = message.model_usage or getattr(self, "sdk_model_usage", None)
-            self.log.event(
-                "result", subtype=message.subtype, is_error=message.is_error, num_turns=message.num_turns,
-                duration_ms=message.duration_ms, duration_api_ms=message.duration_api_ms,
-                sdk_total_cost_usd=message.total_cost_usd, usage=message.usage,
-                model_usage=message.model_usage, stop_reason=message.stop_reason, session_id=message.session_id,
-            )
-        elif isinstance(message, UserMessage):
-            pass  # tool results; timing comes from the hooks
-        else:
-            # Progress ticks (e.g. thinking-token estimates) don't reset the latency clock.
-            name = type(message).__name__
-            if name == "RateLimitEvent":
-                info = getattr(message, "rate_limit_info", None)
-                raw = getattr(info, "raw", None) or (info if isinstance(info, dict) else {})
-                windows = raw.get("unifiedWindows", {}) if isinstance(raw, dict) else {}
-                status = getattr(info, "status", None)
-                error_code = raw.get("errorCode") if isinstance(raw, dict) else None
-                if status == "rejected" and error_code == "credits_required":
-                    # Not a limit that resets: this model needs paid usage credits on this account.
-                    self.access_error = f"{self.model} requires usage credits on this subscription (credits_required)"
-                elif status == "rejected":
-                    self.rate_limited = True
-                    self.rate_limit_resets_at = getattr(info, "resets_at", None)
-                self.log.event(
-                    "rate_limit", status=status, error_code=error_code, limit_type=getattr(info, "rate_limit_type", None),
-                    resets_at=getattr(info, "resets_at", None),
-                    utilization={k: v.get("utilization") for k, v in windows.items()},
-                )
-            elif getattr(message, "subtype", None) != "thinking_tokens":
-                self.log.event("other_message", type=name, subtype=getattr(message, "subtype", None))
-            return
-        self.last_message_at = now
-
-    def handle_stream_event(self, event: dict, now: float) -> None:
-        """Final per-call usage and timing from the raw API stream: message_start
-        opens a call, message_delta carries its final output tokens."""
-        kind = event.get("type")
-        if kind == "message_start":
-            msg = event.get("message", {})
-            self.streaming = {"id": msg.get("id"), "model": msg.get("model"), "usage": dict(msg.get("usage") or {}),
-                              "started": now, "wait_s": now - self.last_message_at}
-        elif kind == "message_delta" and self.streaming:
-            call = self.streaming
-            usage = {**call["usage"], **{k: v for k, v in (event.get("usage") or {}).items() if v is not None}}
-            self.api_calls[call["id"]] = usage
-            self.streaming = None
-            self.log.event(
-                "api_call", message_id=call["id"], model=call["model"], usage=usage,
-                stop_reason=(event.get("delta") or {}).get("stop_reason"),
-                wait_s=round(call["wait_s"], 3), duration_s=round(now - call["started"], 3),
-                call_cost_usd=usage_cost(self.model, usage), cumulative_cost_usd=self.cost_usd(),
-            )
-
     def check_limits(self) -> str | None:
         if self.active_seconds() > self.args.max_hours * 3600:
             return "active_time"  # the time budget excludes usage-limit pauses and submission scoring
@@ -531,56 +437,23 @@ class Run:
                     self.limit_deferred = True
                     self.log.event("limit_deferred", reason=reason, detail="waiting for the submission evaluation to finish")
                 continue
-            self.limit_reason = reason
-            self.log.event("limit_reached", reason=reason, cost_usd=self.cost_usd(), active_s=self.active_seconds())
-            self.save_state()
-            if self.client is not None:
-                await self.client.interrupt()
+            self.reach_limit(reason)
+            await self.interrupt()
+
+    def reach_limit(self, reason: str) -> None:
+        self.limit_reason = reason
+        self.log.event("limit_reached", reason=reason, cost_usd=self.cost_usd(), active_s=self.active_seconds())
+        self.save_state()
+
+    async def interrupt(self) -> None:
+        """Stop the agent's current turn (a limit was reached)."""
+        raise NotImplementedError
+
+    def restore_conversation(self, state: dict) -> None:
+        """Reload the backend's conversation when resuming a run."""
+        raise NotImplementedError
 
     # ---- main loop ----
-
-    def options(self) -> ClaudeAgentOptions:
-        """Agent options; resumes the previous Claude Code session if there is one."""
-        cli = write_agent_cli_wrapper(self.dir / "claude_cli.sh", self.workspace, self.dir / "claude_config")
-        timeout_ms = str(int(self.args.eval_timeout * 1000 + 600_000))
-        return ClaudeAgentOptions(
-            model=self.model,
-            effort=self.args.effort,
-            thinking={"type": "adaptive", "display": "summarized"},
-            cwd=str(self.workspace),
-            cli_path=str(cli),
-            setting_sources=[],  # ignore the user's own settings, CLAUDE.md and memory
-            system_prompt={"type": "preset", "preset": "claude_code"},
-            tools=AGENT_TOOLS,
-            mcp_servers={"harness": self.make_tools()},
-            # dontAsk denies anything not pre-approved here. In particular, Claude Code's
-            # sandbox proxy treats an unlisted network domain as a permission request,
-            # which bypassPermissions would approve; under dontAsk it's refused, so bash
-            # can't fetch the real holdout prices from the internet.
-            allowed_tools=AGENT_TOOLS + ["mcp__harness__submit_policy", "mcp__harness__status", "mcp__harness__finish"],
-            permission_mode="dontAsk",
-            sandbox={
-                "enabled": True,
-                "autoAllowBashIfSandboxed": True,
-                "allowUnsandboxedCommands": False,
-                "failIfUnavailable": True,
-                "network": {"allowedDomains": []},
-            },
-            env={
-                "BASH_DEFAULT_TIMEOUT_MS": str(30 * 60 * 1000),
-                "BASH_MAX_TIMEOUT_MS": str(90 * 60 * 1000),
-                "MCP_TOOL_TIMEOUT": timeout_ms,
-            },
-            hooks={
-                "PreToolUse": [HookMatcher(hooks=[self.pre_tool])],
-                "PostToolUse": [HookMatcher(hooks=[self.post_tool])],
-                "PostToolUseFailure": [HookMatcher(hooks=[self.post_tool])],
-            },
-            resume=self.session_id,
-            include_partial_messages=True,  # stream events carry each API call's final usage
-            max_budget_usd=self.args.max_cost * 1.1,  # backstop; the watchdog normally stops first
-            stderr=lambda line: self.log.event("cli_stderr", line=line[:1000]),
-        )
 
     async def run(self, resume: bool = False) -> None:
         if resume:
@@ -648,39 +521,6 @@ class Run:
                   "(first run with this configuration; several minutes)...", flush=True)
             self.reference = await asyncio.to_thread(compute_reference, self.config)
 
-    async def session(self, prompt: str) -> str:
-        """One connection to Claude Code. Returns "finished", "limit" or "rate_limited"."""
-        async with ClaudeSDKClient(self.options()) as client:
-            self.client = client
-            try:
-                while True:
-                    self.rate_limited = False
-                    self.log.event("prompt", text=prompt)
-                    await client.query(prompt)
-                    async for message in client.receive_response():
-                        self.handle(message)
-                    if self.access_error:
-                        self.finished_reason = "no_model_access"
-                        self.log.event("no_model_access", detail=self.access_error)
-                        print(f"Stopping: {self.access_error}.", flush=True)
-                        return "finished"
-                    if self.finished_reason:
-                        return "finished"
-                    if self.limit_reason:
-                        return "limit"
-                    if self.rate_limited:
-                        return "rate_limited"
-                    if self.nudges >= self.args.max_nudges:
-                        self.finished_reason = "max_nudges"
-                        return "finished"
-                    self.nudges += 1
-                    prompt = (
-                        "You ended your turn without calling the finish tool. "
-                        f"{self.status_text()} Keep working on the task, or call finish if you are done."
-                    )
-            finally:
-                self.client = None
-
     async def pause(self, reason: str, until: float) -> None:
         self.rate_limit_resets_at = until
         self.log.event("pause", reason=reason, until=until, until_local=f"{datetime.fromtimestamp(until):%Y-%m-%d %H:%M:%S}")
@@ -698,7 +538,7 @@ class Run:
         submissions directory. Returns the prompt to resume with, or None if
         the run had already ended."""
         state = json.loads(self.state_path.read_text())
-        self.session_id = state["session_id"]
+        self.restore_conversation(state)
         self.active_before = state["active_seconds"]
         self.nudges = state["nudges"]
         self.finished_reason = state["finished_reason"]
@@ -723,6 +563,9 @@ class Run:
         notes = []
         for snap_dir in sorted(p for p in self.submissions_dir.iterdir() if p.is_dir()):
             n = int(snap_dir.name)
+            if not (snap_dir / "description.json").exists():  # stopped while copying the snapshot
+                shutil.rmtree(snap_dir)
+                continue
             description = json.loads((snap_dir / "description.json").read_text())
             if (snap_dir / "result.json").exists():
                 record = json.loads((snap_dir / "result.json").read_text())
@@ -782,13 +625,13 @@ class Run:
             "run_id": self.run_id,
             "model": self.model,
             "effort": self.args.effort,
+            "billing": self.billing,  # "openrouter": the cost below is real, not API-equivalent
             "ended_by": self.finished_reason or self.limit_reason,
             "wall_seconds": self.log.elapsed(),
             "active_seconds": self.active_seconds(),  # excludes usage-limit pauses and submission scoring
             "submission_eval_seconds": self.submission_eval_seconds,
-            "api_equivalent_cost_usd": self.cost_usd(),
-            "sdk_reported_cost_usd": self.sdk_cost_usd,  # cross-check; includes Claude Code's small side calls
-            "sdk_model_usage": getattr(self, "sdk_model_usage", None),
+            # subscription: API-equivalent cost of the tokens used; openrouter: what OpenRouter billed
+            "cost_usd": self.cost_usd(),
             "api_calls": len(self.api_calls),
             "tokens": self.token_totals(),
             "tools": self.tool_stats,
@@ -809,11 +652,254 @@ class Run:
             "baseline_full_month_pct_of_perfect": self.reference["holdout_full"]["pct_of_perfect"],
             "agent_summary": self.agent_summary,
         }
+        if self.billing == "subscription":
+            summary["sdk_reported_cost_usd"] = self.sdk_cost_usd  # cross-check; includes Claude Code's side calls
+            summary["sdk_model_usage"] = getattr(self, "sdk_model_usage", None)
         (self.dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
         self.log.event("run_end", **{k: summary[k] for k in [
-            "ended_by", "wall_seconds", "active_seconds", "api_equivalent_cost_usd", "final_pct_of_perfect",
+            "ended_by", "wall_seconds", "active_seconds", "cost_usd", "final_pct_of_perfect",
             "final_full_month_pct_of_perfect"]})
         print(json.dumps(summary, indent=2, default=str))
+
+
+class ClaudeCodeRun(Run):
+    """Claude models in Claude Code, through the Claude Agent SDK, on the subscription."""
+
+    def setup_workspace(self) -> None:
+        super().setup_workspace()
+        (self.dir / "claude_config").mkdir()
+
+    def call_cost(self, usage: dict) -> float:
+        return usage_cost(self.model, usage)
+
+    async def interrupt(self) -> None:
+        if self.client is not None:
+            await self.client.interrupt()
+
+    def restore_conversation(self, state: dict) -> None:
+        self.session_id = state["session_id"]
+
+    # ---- tools ----
+
+    def make_tools(self):
+        @tool(
+            "submit_policy",
+            SUBMIT_POLICY_DESCRIPTION,
+            {
+                "type": "object",
+                "properties": {"summary": {"type": "string"}, "rationale": {"type": "string"}},
+                "required": ["summary", "rationale"],
+            },
+        )
+        async def submit_policy(args):
+            text = await self.submit(args.get("summary", ""), args.get("rationale", ""))
+            return {"content": [{"type": "text", "text": text}]}
+
+        @tool("status", STATUS_DESCRIPTION, {})
+        async def status(args):
+            return {"content": [{"type": "text", "text": self.status_text()}]}
+
+        @tool("finish", FINISH_DESCRIPTION, {"summary": str})
+        async def finish(args):
+            return {"content": [{"type": "text", "text": self.finish(args.get("summary", ""))}]}
+
+        return create_sdk_mcp_server(name="harness", tools=[submit_policy, status, finish])
+
+    # ---- hooks ----
+
+    async def pre_tool(self, hook_input, tool_use_id, context):
+        self.tool_starts[tool_use_id] = time.time()
+        self.log.event(
+            "tool_start", tool=hook_input["tool_name"], tool_use_id=tool_use_id,
+            input=_truncate(hook_input.get("tool_input"), 2000),
+        )
+        return {}
+
+    async def post_tool(self, hook_input, tool_use_id, context):
+        failed = hook_input["hook_event_name"] == "PostToolUseFailure"
+        duration = time.time() - self.tool_starts.pop(tool_use_id, time.time())
+        name = hook_input["tool_name"]
+        response = hook_input.get("tool_response", hook_input.get("error"))
+        stats = self.tool_stats.setdefault(name, {"calls": 0, "seconds": 0.0, "failures": 0})
+        stats["calls"] += 1
+        stats["seconds"] += duration
+        stats["failures"] += int(failed)
+        self.log.event(
+            "tool_end", tool=name, tool_use_id=tool_use_id, duration_s=round(duration, 3), failed=failed,
+            response_chars=len(json.dumps(response, default=str)), response=_truncate(response, 2000),
+        )
+        return {}
+
+    # ---- message handling ----
+
+    def handle(self, message) -> None:
+        now = time.time()
+        if isinstance(message, StreamEvent):
+            self.handle_stream_event(message.event, now)
+            return  # far too many to keep in the transcript
+        self.log.transcript(message)
+        session_id = getattr(message, "session_id", None) or (getattr(message, "data", None) or {}).get("session_id")
+        if session_id and session_id != self.session_id:
+            self.session_id = session_id
+            self.log.event("session", session_id=session_id)
+            self.save_state()
+        if isinstance(message, AssistantMessage):
+            if message.error == "rate_limit":
+                self.rate_limited = True
+            first_block = message.message_id not in self.api_calls
+            if message.usage and first_block:
+                # Placeholder: an assistant message's usage is captured at the start of the
+                # response. handle_stream_event replaces it with the final usage.
+                self.api_calls[message.message_id] = message.usage
+            blocks = []
+            for b in message.content:
+                if isinstance(b, TextBlock):
+                    blocks.append({"type": "text", "text": b.text})
+                elif isinstance(b, ThinkingBlock):
+                    blocks.append({"type": "thinking", "text": b.thinking})
+                elif isinstance(b, ToolUseBlock):
+                    blocks.append({"type": "tool_use", "name": b.name, "input": _truncate(b.input, 500)})
+            self.log.event(
+                "assistant_message", message_id=message.message_id, model=message.model,
+                new_api_call=first_block, latency_s=round(now - self.last_message_at, 3),
+                stop_reason=message.stop_reason, usage=message.usage,
+                call_cost_usd=self.call_cost(message.usage or {}),
+                cumulative_cost_usd=self.cost_usd(), blocks=blocks, error=message.error,
+            )
+        elif isinstance(message, ResultMessage):
+            if message.api_error_status == 429:
+                self.rate_limited = True
+            self.result_messages += 1
+            self.sdk_cost_usd = message.total_cost_usd or self.sdk_cost_usd
+            self.sdk_model_usage = message.model_usage or getattr(self, "sdk_model_usage", None)
+            self.log.event(
+                "result", subtype=message.subtype, is_error=message.is_error, num_turns=message.num_turns,
+                duration_ms=message.duration_ms, duration_api_ms=message.duration_api_ms,
+                sdk_total_cost_usd=message.total_cost_usd, usage=message.usage,
+                model_usage=message.model_usage, stop_reason=message.stop_reason, session_id=message.session_id,
+            )
+        elif isinstance(message, UserMessage):
+            pass  # tool results; timing comes from the hooks
+        else:
+            # Progress ticks (e.g. thinking-token estimates) don't reset the latency clock.
+            name = type(message).__name__
+            if name == "RateLimitEvent":
+                info = getattr(message, "rate_limit_info", None)
+                raw = getattr(info, "raw", None) or (info if isinstance(info, dict) else {})
+                windows = raw.get("unifiedWindows", {}) if isinstance(raw, dict) else {}
+                status = getattr(info, "status", None)
+                error_code = raw.get("errorCode") if isinstance(raw, dict) else None
+                if status == "rejected" and error_code == "credits_required":
+                    # Not a limit that resets: this model needs paid usage credits on this account.
+                    self.access_error = f"{self.model} requires usage credits on this subscription (credits_required)"
+                elif status == "rejected":
+                    self.rate_limited = True
+                    self.rate_limit_resets_at = getattr(info, "resets_at", None)
+                self.log.event(
+                    "rate_limit", status=status, error_code=error_code, limit_type=getattr(info, "rate_limit_type", None),
+                    resets_at=getattr(info, "resets_at", None),
+                    utilization={k: v.get("utilization") for k, v in windows.items()},
+                )
+            elif getattr(message, "subtype", None) != "thinking_tokens":
+                self.log.event("other_message", type=name, subtype=getattr(message, "subtype", None))
+            return
+        self.last_message_at = now
+
+    def handle_stream_event(self, event: dict, now: float) -> None:
+        """Final per-call usage and timing from the raw API stream: message_start
+        opens a call, message_delta carries its final output tokens."""
+        kind = event.get("type")
+        if kind == "message_start":
+            msg = event.get("message", {})
+            self.streaming = {"id": msg.get("id"), "model": msg.get("model"), "usage": dict(msg.get("usage") or {}),
+                              "started": now, "wait_s": now - self.last_message_at}
+        elif kind == "message_delta" and self.streaming:
+            call = self.streaming
+            usage = {**call["usage"], **{k: v for k, v in (event.get("usage") or {}).items() if v is not None}}
+            self.api_calls[call["id"]] = usage
+            self.streaming = None
+            self.log.event(
+                "api_call", message_id=call["id"], model=call["model"], usage=usage,
+                stop_reason=(event.get("delta") or {}).get("stop_reason"),
+                wait_s=round(call["wait_s"], 3), duration_s=round(now - call["started"], 3),
+                call_cost_usd=self.call_cost(usage), cumulative_cost_usd=self.cost_usd(),
+            )
+
+    def options(self) -> ClaudeAgentOptions:
+        """Agent options; resumes the previous Claude Code session if there is one."""
+        cli = write_agent_cli_wrapper(self.dir / "claude_cli.sh", self.workspace, self.dir / "claude_config")
+        timeout_ms = str(int(self.args.eval_timeout * 1000 + 600_000))
+        return ClaudeAgentOptions(
+            model=self.model,
+            effort=self.args.effort,
+            thinking={"type": "adaptive", "display": "summarized"},
+            cwd=str(self.workspace),
+            cli_path=str(cli),
+            setting_sources=[],  # ignore the user's own settings, CLAUDE.md and memory
+            system_prompt={"type": "preset", "preset": "claude_code"},
+            tools=AGENT_TOOLS,
+            mcp_servers={"harness": self.make_tools()},
+            # dontAsk denies anything not pre-approved here. In particular, Claude Code's
+            # sandbox proxy treats an unlisted network domain as a permission request,
+            # which bypassPermissions would approve; under dontAsk it's refused, so bash
+            # can't fetch the real holdout prices from the internet.
+            allowed_tools=AGENT_TOOLS + ["mcp__harness__submit_policy", "mcp__harness__status", "mcp__harness__finish"],
+            permission_mode="dontAsk",
+            sandbox={
+                "enabled": True,
+                "autoAllowBashIfSandboxed": True,
+                "allowUnsandboxedCommands": False,
+                "failIfUnavailable": True,
+                "network": {"allowedDomains": []},
+            },
+            env={
+                "BASH_DEFAULT_TIMEOUT_MS": str(30 * 60 * 1000),
+                "BASH_MAX_TIMEOUT_MS": str(90 * 60 * 1000),
+                "MCP_TOOL_TIMEOUT": timeout_ms,
+            },
+            hooks={
+                "PreToolUse": [HookMatcher(hooks=[self.pre_tool])],
+                "PostToolUse": [HookMatcher(hooks=[self.post_tool])],
+                "PostToolUseFailure": [HookMatcher(hooks=[self.post_tool])],
+            },
+            resume=self.session_id,
+            include_partial_messages=True,  # stream events carry each API call's final usage
+            max_budget_usd=self.args.max_cost * 1.1,  # backstop; the watchdog normally stops first
+            stderr=lambda line: self.log.event("cli_stderr", line=line[:1000]),
+        )
+
+    async def session(self, prompt: str) -> str:
+        """One connection to Claude Code. Returns "finished", "limit" or "rate_limited"."""
+        async with ClaudeSDKClient(self.options()) as client:
+            self.client = client
+            try:
+                while True:
+                    self.rate_limited = False
+                    self.log.event("prompt", text=prompt)
+                    await client.query(prompt)
+                    async for message in client.receive_response():
+                        self.handle(message)
+                    if self.access_error:
+                        self.finished_reason = "no_model_access"
+                        self.log.event("no_model_access", detail=self.access_error)
+                        print(f"Stopping: {self.access_error}.", flush=True)
+                        return "finished"
+                    if self.finished_reason:
+                        return "finished"
+                    if self.limit_reason:
+                        return "limit"
+                    if self.rate_limited:
+                        return "rate_limited"
+                    if self.nudges >= self.args.max_nudges:
+                        self.finished_reason = "max_nudges"
+                        return "finished"
+                    self.nudges += 1
+                    prompt = (
+                        "You ended your turn without calling the finish tool. "
+                        f"{self.status_text()} Keep working on the task, or call finish if you are done."
+                    )
+            finally:
+                self.client = None
 
 
 def load_or_rebuild_state(run_dir: Path) -> dict:
@@ -841,24 +927,7 @@ def _truncate(value, limit: int):
     return text if len(text) <= limit else text[:limit] + f"... [{len(text) - limit} more chars]"
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model", default="claude-sonnet-5-5", choices=sorted(PRICES))
-    parser.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"])
-    parser.add_argument("--max-hours", type=float, default=2.0)
-    parser.add_argument("--max-cost", type=float, default=20.0, help="API-equivalent USD")
-    parser.add_argument("--max-submissions", type=int, default=5)
-    parser.add_argument("--ramp-rate", type=float, help="the battery's ramp rate in MW/min (default: from the config)")
-    parser.add_argument("--eval-timeout", type=float, default=900,
-                        help="seconds per (region, episode) job when scoring a submission")
-    parser.add_argument("--max-nudges", type=int, default=5, help="times to prompt the agent to continue")
-    parser.add_argument("--max-pause-hours", type=float, default=12.0,
-                        help="longest usage-limit wait to sit through; longer limits exit for a later --resume")
-    parser.add_argument("--max-retries", type=int, default=5, help="consecutive CLI failures before giving up")
-    parser.add_argument("--run-id")
-    parser.add_argument("--resume", metavar="RUN_ID", help="continue an interrupted run")
-    args = parser.parse_args()
-
+def setup_subscription_token() -> None:
     if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and TOKEN_FILE.exists():
         os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = TOKEN_FILE.read_text().strip()
     if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
@@ -868,10 +937,44 @@ if __name__ == "__main__":
         )
     if os.environ.pop("ANTHROPIC_API_KEY", None):
         print("Note: ignoring ANTHROPIC_API_KEY so the run uses the subscription, not API billing.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", default="claude-sonnet-5-5",
+                        help=f"a Claude model on the subscription ({', '.join(sorted(PRICES))}) or an OpenRouter slug")
+    parser.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"],
+                        help="thinking effort (Claude) or reasoning effort (OpenRouter)")
+    parser.add_argument("--max-hours", type=float, default=2.0)
+    parser.add_argument("--max-cost", type=float, default=20.0,
+                        help="USD: API-equivalent for Claude runs, real OpenRouter spend for OpenRouter runs")
+    parser.add_argument("--max-submissions", type=int, default=5)
+    parser.add_argument("--ramp-rate", type=float, help="the battery's ramp rate in MW/min (default: from the config)")
+    parser.add_argument("--eval-timeout", type=float, default=900,
+                        help="seconds per (region, episode) job when scoring a submission")
+    parser.add_argument("--max-nudges", type=int, default=5, help="times to prompt the agent to continue")
+    parser.add_argument("--max-pause-hours", type=float, default=12.0,
+                        help="longest usage-limit wait to sit through; longer limits exit for a later --resume")
+    parser.add_argument("--max-retries", type=int, default=5, help="consecutive API or CLI failures before giving up")
+    parser.add_argument("--run-id")
+    parser.add_argument("--resume", metavar="RUN_ID", help="continue an interrupted run")
+    args = parser.parse_args()
     if args.resume:
         state = load_or_rebuild_state(RUNS_DIR / args.resume)
         defaults = vars(parser.parse_args([]))  # for options added after the run started
         args = argparse.Namespace(**{**defaults, **state["args"], "run_id": args.resume, "resume": args.resume})
-        asyncio.run(Run(args).run(resume=True))
+
+    if is_openrouter(args.model):
+        from harness.openrouter_agent import OpenRouterRun, check_model, load_api_key
+
+        load_api_key()
+        if not args.resume:
+            asyncio.run(check_model(args.model, args.max_cost))  # before a run directory exists
+        run = OpenRouterRun(args)
     else:
-        asyncio.run(Run(args).run())
+        if args.model not in PRICES:
+            raise SystemExit(f"Unknown Claude model {args.model!r}: use one of {', '.join(sorted(PRICES))}, "
+                             "or an OpenRouter slug like openai/gpt-5.1")
+        setup_subscription_token()
+        run = ClaudeCodeRun(args)
+    asyncio.run(run.run(resume=bool(args.resume)))

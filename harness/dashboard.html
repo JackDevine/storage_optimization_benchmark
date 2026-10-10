@@ -21,6 +21,9 @@
     --series-3: #1baf7a;
     --series-4: #eda100;
     --series-5: #e87ba4;
+    --series-6: #008300;
+    --series-7: #4a3aa7;
+    --series-8: #e34948;
     --good: #0ca30c;
     --critical: #d03b3b;
     --warning: #fab219;
@@ -42,6 +45,9 @@
       --series-3: #199e70;
       --series-4: #c98500;
       --series-5: #d55181;
+      --series-6: #008300;
+      --series-7: #9085e9;
+      --series-8: #e66767;
       --wash: rgba(57, 135, 229, 0.12);
     }
   }
@@ -60,6 +66,9 @@
     --series-3: #199e70;
     --series-4: #c98500;
     --series-5: #d55181;
+    --series-6: #008300;
+    --series-7: #9085e9;
+    --series-8: #e66767;
     --wash: rgba(57, 135, 229, 0.12);
   }
   * { box-sizing: border-box; }
@@ -172,7 +181,7 @@
           <select id="progress-x">
             <option value="wall_s">Wall time</option>
             <option value="active_s">Active model time</option>
-            <option value="cost_usd">API-equivalent cost</option>
+            <option value="cost_usd">Cost</option>
             <option value="output_tokens">Output tokens</option>
             <option value="total_tokens">Total tokens</option>
           </select>
@@ -197,7 +206,7 @@
           <select id="compare-x">
             <option value="wall_s">Wall time</option>
             <option value="active_s" selected>Active model time</option>
-            <option value="cost_usd">API-equivalent cost</option>
+            <option value="cost_usd">Cost</option>
             <option value="output_tokens">Output tokens</option>
             <option value="total_tokens">Total tokens</option>
           </select>
@@ -396,7 +405,7 @@ function drawBid(disp) {
 const X_AXES = {
   wall_s: { title: "Wall time (h)", scale: 1 / 3600, fmt: (v) => mins(v) },
   active_s: { title: "Active model time (h)", scale: 1 / 3600, fmt: (v) => mins(v) },
-  cost_usd: { title: "API-equivalent cost ($)", scale: 1, fmt: (v) => "$" + v.toFixed(2) },
+  cost_usd: { title: "Cost ($): API-equivalent for Claude, billed for OpenRouter", scale: 1, fmt: (v) => "$" + v.toFixed(2) },
   output_tokens: { title: "Output tokens", scale: 1, fmt: compact },
   total_tokens: { title: "Total tokens (incl. cache)", scale: 1, fmt: compact },
 };
@@ -476,20 +485,35 @@ function drawProgress(s) {
 
 // ---------- compare runs ----------
 
-// Colour follows the model family, in a fixed order; repeat runs of a model get a different dash.
-const MODEL_COLOURS = [["opus", "--series-1"], ["sonnet", "--series-2"], ["haiku", "--series-3"], ["fable", "--series-4"]];
+// Colour follows the model family: the Claude family (opus, sonnet, ...) or the OpenRouter slug's vendor.
+// Families take the categorical slots in the order they first ran, over all runs, so adding runs or
+// toggling filters never repaints one. Past the eighth family, colours fold to grey.
+// Repeat runs of a family get a different dash.
 const DASHES = ["solid", "dash", "dot", "dashdot"];
-const modelFamily = (m) => (MODEL_COLOURS.find(([k]) => (m || "").includes(k)) || ["other", "--series-5"]);
-const modelName = (m) => (m || "?").replace(/^claude-/, "").replace(/-(\d+)-(\d+)$/, " $1.$2").replace(/^./, (c) => c.toUpperCase());
+const familyOf = (m) => {
+  m = m || "?";
+  const claude = ["opus", "sonnet", "haiku", "fable"].find((k) => m.includes(k));
+  return m.startsWith("anthropic/") || !m.includes("/") ? (claude || m) : m.split("/")[0];
+};
+function familyColours(runs) {
+  const order = [];
+  for (const r of [...runs].sort((a, b) => (a.started ?? 0) - (b.started ?? 0))) if (!order.includes(familyOf(r.model))) order.push(familyOf(r.model));
+  return Object.fromEntries(order.map((f, i) => [f, css(i < 8 ? `--series-${i + 1}` : "--text-muted")]));
+}
+const isOpenRouter = (m) => (m || "").includes("/");  // OpenRouter slugs are vendor/model
+const modelName = (m) => isOpenRouter(m)
+  ? m.split("/").slice(1).join("/") + (m.startsWith("anthropic/") ? " (OpenRouter)" : "")
+  : (m || "?").replace(/^claude-/, "").replace(/-(\d+)-(\d+)$/, " $1.$2").replace(/^./, (c) => c.toUpperCase());
 
 function drawCompare(data) {
   if (!data) return;
   const xKey = $("compare-x").value, yKey = $("compare-y").value, ax = X_AXES[xKey];
   const yOf = (sub) => yKey === "pct" ? sub.pct_of_perfect : sub.net_revenue;
-  const runs = data.runs.filter((r) => r.comparable || $("compare-old").checked).slice().reverse();  // oldest first
-  const seen = {}, traces = [], annotations = [], shapes = [], ys = [0], xs = [0];
+  const runs = data.runs.filter((r) => r.comparable || $("compare-old").checked)
+    .sort((a, b) => (a.started ?? 0) - (b.started ?? 0));  // oldest first
+  const seen = {}, traces = [], annotations = [], shapes = [], ys = [0], xs = [0], colours = familyColours(data.runs);
   for (const r of runs) {
-    const [family, token] = modelFamily(r.model), colour = css(token);
+    const family = familyOf(r.model), colour = colours[family];
     const dash = DASHES[(seen[family] = (seen[family] ?? -1) + 1) % DASHES.length];
     const label = `${modelName(r.model)} · ${r.run_id.slice(9, 11)}:${r.run_id.slice(11, 13)}` + (r.comparable ? "" : " (old rules)") + (r.running ? " (running)" : "");
     const xOf = (sub) => sub.x[xKey] * ax.scale, endX = r.now_x[xKey] * ax.scale;
@@ -600,7 +624,7 @@ function renderStatus(s) {
         : s.stopped ? `restart with --resume ${s.run_id}`
         : [s.model, !s.running && (s.ended_by || "").replaceAll("_", " ")].filter(Boolean).join(" · ")),
     tile("Active time", mins(s.active_s ?? s.elapsed_s), (s.args ? `limit ${s.args.max_hours} h` : "") + ` · wall ${mins(s.elapsed_s)}`),
-    tile("API-equivalent cost", "$" + s.cost_usd.toFixed(2), s.args ? `limit $${s.args.max_cost}` : ""),
+    tile(isOpenRouter(s.model) ? "OpenRouter cost" : "API-equivalent cost", "$" + s.cost_usd.toFixed(2), s.args ? `limit $${s.args.max_cost}` : ""),
     tile("Tokens", compact(tok.input_tokens + tok.cache_read_input_tokens + tok.cache_creation_input_tokens) + " in", `${compact(tok.output_tokens)} out · ${compact(tok.cache_read_input_tokens)} cache read`),
     tile("API calls", String(s.api_calls), ""),
     tile("Tool calls", String(toolCalls), Object.entries(s.tools).sort((a, b) => b[1].calls - a[1].calls).slice(0, 3).map(([k, v]) => `${k.replace("mcp__harness__", "")} ${v.calls}`).join(" · ")),
