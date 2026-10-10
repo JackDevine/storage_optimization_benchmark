@@ -111,6 +111,36 @@ by (config, policy, region), where config is the config file's name.
       band prices it rounds towards doing less, so it never dispatches more than the MILP wanted at that price.
   - `perfect_foresight`: the same MILP solved once over actual prices. It's the ceiling that
     `pct_of_perfect` is measured against.
+- `bess/static_bid.py`: the static bid baselines, which use no forecasts at all.
+  - **The bid:** 10 load bands and 10 gen bands with prices fixed for all time. Every load price is below every
+    gen price, so the bid is always convex and never charges and discharges at once.
+  - **Three variants**, by what the band MW may depend on:
+    - `static_bid`: nothing (40 numbers per region).
+    - `static_bid_tod`: the time of day, in 30-minute blocks.
+    - `static_bid_tod_soc`: the time of day and the state of charge, in 3 bins.
+  - **MaxAvail** is the only thing that changes otherwise. Each side's is the largest end-of-interval MW from which
+    the unit can still ramp back to 0 at its own rate without leaving its SOC limits. With straight-line dispatch,
+    ending an interval at x MW means x·dt/2 more next interval, so this matters. It's closed-form, and it means
+    whatever clears is deliverable, so the policy never causes non-conformance.
+  - **Fitting:** `scripts/fit_static_bids.py` fits one bid per region to dev prices with CMA-ES, on a fast
+    vectorised simulator for these bids. `scripts/check_static_bid_parity.py` checks that simulator against
+    `bess/sim.py`. The fit is a one-off, and `cma` isn't a project dependency: run it with
+    `uv run --with cma==4.5.0 python scripts/fit_static_bids.py --validate`. The fitted parameters live in
+    `harness/static_bid_policies/<variant>/params.json`, next to a `policy.py` in the submission format.
+  - **Scoring:** `harness.evaluator reference` scores them with the MILP baseline on every reference set. A
+    refit is re-scored automatically, keyed by a hash of its parameters. Submission feedback, `summary.json` and
+    the dashboard report them alongside the MILP baseline. They're fitted to dev prices, so their dev scores are
+    in-sample; the brief says so.
+  - **Results** (% of perfect foresight; MILP baseline: dev 26.3, holdout episodes 33.3, full month 38.3):
+
+    | Variant | June fit → July | Dev (in-sample) | Holdout episodes | Full month | Fit time |
+    |---|---|---|---|---|---|
+    | `static_bid` | 63.6 → 27.7 | 51.5 | 20.1 | 19.7 | 18 min |
+    | `static_bid_tod` | 73.0 → 31.6 | 60.2 | 25.6 | 24.3 | 34 min |
+    | `static_bid_tod_soc` | 73.1 → 30.8 | 60.3 | 25.8 | 24.4 | 40 min |
+
+    They overfit badly, mostly to a few SA1 cap-price spikes (SA1 is negative on the holdout). The SOC bins add
+    nothing; the time-of-day blocks add about 5 points out of sample.
 
 ## Agent experiments
 

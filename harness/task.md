@@ -110,7 +110,9 @@ These forecasts are AEMO's own. They are often wrong, especially around price sp
   - the baseline policies (`policies.py`)
 
   `harness/reference_policy/policy.py` is the baseline in the submission format: it re-solves an MILP on the forecast
-  every interval and bids the first interval's MW as a setpoint.
+  every interval and bids the first interval's MW as a setpoint. `harness/static_bid_policies/` holds three more
+  baselines, each a fixed bid curve per region fitted to the dev prices. Because they're fitted to the dev data,
+  their dev scores flatter them.
 - Python libraries: numpy, pandas, duckdb, highspy, pyarrow. There is no network access, so you can't install
   anything else.
 - `python -m harness.dev_eval --quick` scores on a sample of 3-day dev episodes chosen the same way as the holdout
@@ -119,7 +121,7 @@ These forecasts are AEMO's own. They are often wrong, especially around price sp
   - total net revenue
   - % of perfect foresight across all regions
   - whether the run was valid
-  - the baseline's holdout score, for comparison
+  - the baselines' holdout scores, for comparison
 
   You have **{max_submissions} submissions**. Your final score is your **last valid submission**, so don't submit
   something worse last. A submission takes a few minutes. Episodes run in parallel, and **each three-day episode

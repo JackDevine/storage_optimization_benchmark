@@ -454,6 +454,7 @@ function drawProgress(s) {
   }
   const baseline = yKey === "pct" ? s.baseline_holdout_pct : s.baseline_holdout_net_revenue;
   const shapes = [], annotations = [];
+  const otherYs = otherBaselineTraces(traces, s.other_baselines, yKey);
   if (baseline != null) {
     shapes.push({ type: "line", xref: "paper", x0: 0, x1: 1, y0: baseline, y1: baseline, line: { color: css("--text-muted"), width: 1 } });
     annotations.push({ xref: "paper", x: 0, y: baseline, yanchor: "bottom", xanchor: "left", showarrow: false,
@@ -463,7 +464,7 @@ function drawProgress(s) {
   annotations.push({ x: nowX, xref: "x", yref: "paper", y: 1, yanchor: "bottom", xanchor: "right", showarrow: false,
     text: s.axes_frozen ? "run end" : "now", font: { color: css("--text-muted"), size: 11 } });
 
-  const ys = [...by, ...valid.map(yOf), baseline ?? 0, 0, ...(ff && yKey === "pct" && ff.pct_of_perfect != null ? [ff.pct_of_perfect] : [])];
+  const ys = [...by, ...valid.map(yOf), baseline ?? 0, 0, ...otherYs, ...(ff && yKey === "pct" && ff.pct_of_perfect != null ? [ff.pct_of_perfect] : [])];
   Plotly.react("progress", traces, {
     paper_bgcolor: css("--surface-1"), plot_bgcolor: css("--surface-1"), font: { color: css("--text-primary"), family: "system-ui, sans-serif" },
     margin: { l: 70, r: 16, t: 10, b: 44 }, showlegend: true,
@@ -549,6 +550,7 @@ function drawCompare(data) {
   }
   const ref = runs.find((r) => r.comparable) || runs[0];
   const baseline = ref && (yKey === "pct" ? ref.baseline_holdout_pct : ref.baseline_holdout_net_revenue);
+  if (ref) ys.push(...otherBaselineTraces(traces, ref.other_baselines, yKey));
   if (baseline != null) {
     ys.push(baseline);
     shapes.push({ type: "line", xref: "paper", x0: 0, x1: 1, y0: baseline, y1: baseline, line: { color: css("--text-muted"), width: 1, dash: "dash" } });
@@ -570,6 +572,24 @@ function drawCompare(data) {
     "Circles are submissions; colour is the model." + (yKey === "pct" ? " Diamonds are the final submission scored on the full month." : "") +
     (hidden ? ` ${hidden} run(s) under older market rules are hidden; their scores aren't comparable.` : "") +
     ($("compare-old").checked && runs.some((r) => !r.comparable) ? " Dotted lines are runs under older rules, scored against a different baseline." : "");
+}
+
+// The static bid baselines, as legend entries (dash-dot, muted ink) rather than
+// labelled lines: their scores sit close together, so labels would collide.
+const BASELINE_NAMES = { static_bid: "static bid", static_bid_tod: "static bid, time of day",
+  static_bid_tod_soc: "static bid, time of day + SOC" };
+const BASELINE_DASHES = ["dashdot", "dot", "longdashdot"];
+function otherBaselineTraces(traces, list, yKey) {
+  const ys = [];
+  (list || []).forEach((b, i) => {
+    const y = yKey === "pct" ? b.holdout_pct : b.holdout_net_revenue;
+    if (y == null) return;
+    const label = `${BASELINE_NAMES[b.name] || b.name} ${yKey === "pct" ? pct(y) : money(y)}`;
+    traces.push({ name: label, x: [0, 1e15], y: [y, y], mode: "lines", hoverinfo: "name",
+      line: { color: css("--text-muted"), width: 1.5, dash: BASELINE_DASHES[i % BASELINE_DASHES.length] } });
+    ys.push(y);
+  });
+  return ys;
 }
 
 async function pollCompare() {

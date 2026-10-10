@@ -12,7 +12,7 @@ take about one episode's simulated time. The score is the total net revenue
 across all jobs as a percentage of perfect foresight's total over the same
 windows; each window starts from the battery's initial SOC.
 
-    uv run python -m harness.evaluator reference   # cache baseline scores
+    uv run python -m harness.evaluator reference   # cache baseline scores (all baselines)
 """
 
 import argparse
@@ -39,6 +39,14 @@ from harness.splits import (
 )
 
 REFERENCE_POLICY_DIR = Path(__file__).resolve().parent / "reference_policy"
+# Further baselines, scored alongside the reference policy when their fitted
+# parameters exist (scripts/fit_static_bids.py): name -> policy directory.
+STATIC_BID_DIR = Path(__file__).resolve().parent / "static_bid_policies"
+OTHER_BASELINES = {
+    "static_bid": STATIC_BID_DIR / "static",
+    "static_bid_tod": STATIC_BID_DIR / "tod",
+    "static_bid_tod_soc": STATIC_BID_DIR / "tod_soc",
+}
 REFERENCE_DIR = PROJECT_ROOT / "data" / "reference_scores"
 REFERENCE_PATH = PROJECT_ROOT / "data" / "reference_scores.json"  # legacy: one file for the default config
 # Bump when the simulator's scoring rules change, so baselines get recomputed.
@@ -224,17 +232,64 @@ REFERENCE_SETS = {
 
 def compute_reference(config: Config) -> dict:
     """Baseline (milp_forecast) scores on the dev and holdout windows and
-    episodes, under `config`. Cached per configuration, so a run is always
-    compared with a baseline that faced the same rules (e.g. ramp rate)."""
+    episodes, under `config`, plus the other baselines (see update_reference).
+    Cached per configuration, so a run is always compared with a baseline that
+    faced the same rules (e.g. ramp rate)."""
     scores = {"config": config_to_dict(config), "sim_version": SIM_VERSION}
     for name, windows in REFERENCE_SETS.items():
         scores[name] = evaluate(REFERENCE_POLICY_DIR, config, windows, sandboxed=False, timeout_s=7200)
         print(f"{name}: {scores[name]['pct_of_perfect']:.1f}% of perfect foresight "
               f"({scores[name]['eval_seconds']:.0f}s)", flush=True)
+    _save_reference(config, scores)
+    return update_reference(config)
+
+
+def _save_reference(config: Config, scores: dict) -> None:
     path = reference_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(scores, indent=2, default=str))
+
+
+def _params_sha(policy_dir: Path) -> str | None:
+    params = policy_dir / "params.json"
+    return hashlib.sha1(params.read_bytes()).hexdigest()[:12] if params.exists() else None
+
+
+def update_reference(config: Config) -> dict:
+    """Add the other baselines (OTHER_BASELINES) to the cached scores for
+    `config`, computing any that are missing or whose fitted parameters have
+    changed since. The milp_forecast scores stay at the top level; the others
+    go under "other_baselines"[name][set name]. Computes everything if nothing
+    is cached yet."""
+    scores = load_reference(config)
+    if scores is None:
+        return compute_reference(config)
+    others = scores.setdefault("other_baselines", {})
+    changed = False
+    for name, policy_dir in OTHER_BASELINES.items():
+        sha = _params_sha(policy_dir)
+        if sha is None or others.get(name, {}).get("params_sha") == sha:
+            continue
+        entry = {"params_sha": sha}
+        for set_name, windows in REFERENCE_SETS.items():
+            entry[set_name] = evaluate(policy_dir, config, windows, sandboxed=False, timeout_s=7200)
+            print(f"{name} {set_name}: {entry[set_name]['pct_of_perfect']:.1f}% of perfect foresight "
+                  f"({entry[set_name]['eval_seconds']:.0f}s)", flush=True)
+        others[name] = entry
+        changed = True
+    if changed:
+        _save_reference(config, scores)
     return scores
+
+
+def baseline_pcts(reference: dict, set_name: str) -> dict[str, float]:
+    """% of perfect foresight on one reference set, for every baseline in
+    `reference`: {"milp_forecast": ..., "static_bid": ..., ...}."""
+    out = {"milp_forecast": reference[set_name]["pct_of_perfect"]}
+    for name, entry in reference.get("other_baselines", {}).items():
+        if set_name in entry:
+            out[name] = entry[set_name]["pct_of_perfect"]
+    return out
 
 
 def load_reference(config: Config) -> dict | None:
@@ -273,5 +328,6 @@ if __name__ == "__main__":
         print(f"config {config_fingerprint(config)}", flush=True)
         if reference_path(config).exists() and not args.force:
             print(f"Already cached: {reference_path(config)} (use --force to recompute)")
+            update_reference(config)  # adds or refreshes the other baselines if needed
         else:
             compute_reference(config)

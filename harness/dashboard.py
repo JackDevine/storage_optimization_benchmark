@@ -31,7 +31,7 @@ from bess.data import load_region
 from bess.policies import PerfectForesight
 from bess.remote import config_from_dict
 from bess.sim import simulate
-from harness.evaluator import REFERENCE_DIR, REFERENCE_PATH, SIM_VERSION, config_fingerprint
+from harness.evaluator import REFERENCE_DIR, REFERENCE_PATH, SIM_VERSION, config_fingerprint, load_reference
 from harness.run_agent import CONFIG_PATH, RUNS_DIR
 from harness.splits import HOLDOUT_END, HOLDOUT_EPISODES, HOLDOUT_START, REGIONS
 
@@ -230,6 +230,7 @@ def run_status(run_id: str) -> dict:
     stale = state.get("saved_at") and time.time() - state["saved_at"] > 120  # harness not saving: process stopped
     holdout_ref = reference.get("holdout_episodes", reference.get("holdout", {})) if reference else {}
     full_ref = reference.get("holdout_full", {}) if reference else {}
+    other_baselines = _other_baselines(reference)
 
     # Where the run's x-axes end. A live run keeps growing; once the agent has
     # stopped, every axis freezes at that moment. The full-month final
@@ -276,9 +277,26 @@ def run_status(run_id: str) -> dict:
         "final_pct_of_perfect": valid[-1]["pct_of_perfect"] if valid else None,
         "baseline_holdout_pct": holdout_ref.get("pct_of_perfect"),
         "baseline_full_month_pct": full_ref.get("pct_of_perfect"),
+        "other_baselines": other_baselines,
         "final_full_month": final_full,
         "feed": feed[-80:],
     }
+
+
+def _other_baselines(reference: dict | None) -> list[dict]:
+    """The baselines besides milp_forecast (static bids), from the run's own
+    reference copy, or, for runs started before they existed, from the current
+    cache when the run was scored under the current config."""
+    others = (reference or {}).get("other_baselines")
+    if others is None and reference and reference.get("sim_version") == SIM_VERSION and "config" in reference:
+        if config_fingerprint(config_from_dict(reference["config"])) == config_fingerprint(CONFIG):
+            others = (load_reference(CONFIG) or {}).get("other_baselines")
+    return [
+        {"name": name, "holdout_pct": e["holdout_episodes"].get("pct_of_perfect"),
+         "holdout_net_revenue": e["holdout_episodes"].get("net_revenue"),
+         "full_month_pct": e.get("holdout_full", {}).get("pct_of_perfect")}
+        for name, e in (others or {}).items() if "holdout_episodes" in e
+    ]
 
 
 def compare_runs() -> dict:
@@ -297,7 +315,8 @@ def compare_runs() -> dict:
             "run_id": run_id, "model": s["model"], "running": s["running"], "comparable": fingerprint == current,
             "started": next((e["t"] for e in run_events(run_id)), None),
             **{k: s[k] for k in ("submissions", "now_x", "axes_frozen", "final_full_month",
-                                 "baseline_holdout_pct", "baseline_holdout_net_revenue", "baseline_full_month_pct")},
+                                 "baseline_holdout_pct", "baseline_holdout_net_revenue", "baseline_full_month_pct",
+                                 "other_baselines")},
         })
     return {"fingerprint": current, "runs": runs}
 

@@ -71,7 +71,9 @@ from claude_agent_sdk import (
 )
 
 from bess.config import load_config
-from harness.evaluator import FULL_MONTH_TIMEOUT_FACTOR, compute_reference, config_fingerprint, evaluate, load_reference
+from harness.evaluator import (
+    FULL_MONTH_TIMEOUT_FACTOR, baseline_pcts, config_fingerprint, evaluate, load_reference, update_reference,
+)
 from harness.sandbox import PROJECT_ROOT, write_agent_cli_wrapper
 from harness.splits import HOLDOUT_END, HOLDOUT_EPISODES, HOLDOUT_START
 
@@ -412,6 +414,10 @@ class Run:
         else:
             lines.append(f"FAILED: {result['error'][:1000]}")
         lines.append(f"Baseline (milp_forecast) on the same holdout episodes: {baseline:.1f}% of perfect foresight.")
+        others = {k: v for k, v in baseline_pcts(self.reference, "holdout_episodes").items() if k != "milp_forecast"}
+        if others:
+            lines.append("Other baselines on the same episodes: "
+                         + ", ".join(f"{k} {v:.1f}%" for k, v in others.items()) + ".")
         lines.append(f"Evaluation took {record['eval_seconds'] / 60:.1f} min. {self.status_text()}")
         return "\n".join(lines)
 
@@ -515,11 +521,12 @@ class Run:
 
     async def ensure_reference(self) -> None:
         """Compute baseline scores for this configuration if they aren't cached yet
-        (e.g. a new --ramp-rate). Takes several minutes; happens before the agent starts."""
+        (e.g. a new --ramp-rate), or a baseline whose fitted parameters changed.
+        Takes several minutes when it has work to do; happens before the agent starts."""
         if self.reference is None:
             print(f"Computing baseline scores for config {config_fingerprint(self.config)} "
                   "(first run with this configuration; several minutes)...", flush=True)
-            self.reference = await asyncio.to_thread(compute_reference, self.config)
+        self.reference = await asyncio.to_thread(update_reference, self.config)
 
     async def pause(self, reason: str, until: float) -> None:
         self.rate_limit_resets_at = until
@@ -650,6 +657,7 @@ class Run:
             "final_full_month_pct_of_perfect": full.get("pct_of_perfect") if full else None,
             "final_full_month_valid": full.get("valid") if full else None,
             "baseline_full_month_pct_of_perfect": self.reference["holdout_full"]["pct_of_perfect"],
+            "baselines": {s: baseline_pcts(self.reference, s) for s in ("holdout_episodes", "holdout_full")},
             "agent_summary": self.agent_summary,
         }
         if self.billing == "subscription":
