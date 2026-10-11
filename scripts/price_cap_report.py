@@ -137,6 +137,7 @@ def scatter_data() -> dict:
             "cap300": d.cap300.round(3).tolist(), "cap1000": d.cap1000.round(3).tolist(),
             "fy": fy.astype(int).tolist(), "region": d.region.map(REGIONS.index).tolist(),
             "day": d.day.dt.strftime("week of %d %b %Y").tolist(),
+            "start": d.day.dt.strftime("%Y-%m-%d").tolist(),
         }
     return out
 
@@ -263,6 +264,70 @@ const SC = __SCATTER__;
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
   new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
   draw();
+
+  // ---- correlation matrices by financial year ----
+  const methodSel = document.getElementById("cm-method"), holdoutBox = document.getElementById("cm-holdout");
+  const VARS = [["arb", "arbitrage"], ["swap", "mean price"], ["cap300", "> $300"], ["cap1000", "> $1,000"]];
+  const devEnd = new Date(SC.dev_end);
+  const isDev = d => i => (new Date(d.start[i]).getTime() + 7 * 864e5) <= devEnd.getTime();
+  function ranks(a) {
+    const o = a.map((v, i) => [v, i]).sort((p, q) => p[0] - q[0]), r = new Array(a.length);
+    for (let i = 0; i < o.length;) { let j = i; while (j + 1 < o.length && o[j + 1][0] === o[i][0]) j++;
+      for (let k = i; k <= j; k++) r[o[k][1]] = (i + j) / 2; i = j + 1; }
+    return r;
+  }
+  function corr(a, b) {
+    const n = a.length; if (n < 3) return NaN;
+    const ma = a.reduce((s, v) => s + v, 0) / n, mb = b.reduce((s, v) => s + v, 0) / n;
+    let sab = 0, saa = 0, sbb = 0;
+    for (let i = 0; i < n; i++) { const x = a[i] - ma, y = b[i] - mb; sab += x * y; saa += x * x; sbb += y * y; }
+    return saa && sbb ? sab / Math.sqrt(saa * sbb) : NaN;
+  }
+  function matrix(d, rows, method) {
+    let cols = VARS.map(([k]) => rows.map(i => d[k][i]));
+    if (method === "spearman") cols = cols.map(ranks);
+    return cols.map(a => cols.map(b => corr(a, b)));
+  }
+  function cell(v, self) {
+    if (self) return '<td class="self">1</td>';
+    if (!isFinite(v)) return "<td>–</td>";
+    const pct = Math.round(Math.abs(v) * 70);
+    return `<td style="background:color-mix(in srgb, var(${v >= 0 ? "--pos" : "--neg"}) ${pct}%, var(--panel))">${v.toFixed(2)}</td>`;
+  }
+  function drawMatrices() {
+    const method = methodSel.value, rg = regionSel.value, withHoldout = holdoutBox.checked;
+    const d0 = SC.raw;
+    const base = d0.fy.map((_, i) => i).filter(i => (rg === "all" || d0.region[i] === +rg) && (withHoldout || isDev(d0)(i)));
+    const yearsHere = [...new Set(base.map(i => d0.fy[i]))].sort();
+    const blocks = [["all", base], ...yearsHere.map(y => [y, base.filter(i => d0.fy[i] === y)])];
+    const names = { raw: "Raw prices", mapped: "$1,000 knee", scaled: "Constant scaling" };
+    let html = "";
+    for (const [y, rows] of blocks) {
+      const above = rows.filter(i => d0.cap1000[i] > 0).length;
+      const flags = [];
+      if (rows.length < 60) flags.push(`small sample: ${rows.length} region-weeks`);
+      if (above < 15) flags.push(`only ${above} region-weeks with any raw price above $1,000`);
+      const partial = y === 2026 && !withHoldout ? " (July–August 2025 only)" : "";
+      html += `<div class="cm-year">${y === "all" ? (withHoldout ? "All years" : "All dev years") : fyLabel(y) + partial}` +
+        `<small>${rows.length} region-weeks, ${above} with raw prices above $1,000` +
+        (flags.length ? ` · <span class="flag">${flags.join("; ")}</span>` : "") + "</small></div><div class=\"cm-row\">";
+      for (const k of KEYS) {
+        const m = matrix(SC[k], rows, method);
+        html += `<figure><figcaption>${names[k]}</figcaption><table class="cm"><thead><tr><th></th>` +
+          VARS.map(([, l]) => `<th>${l}</th>`).join("") + "</tr></thead><tbody>" +
+          m.map((r, a) => `<tr><th>${VARS[a][1]}</th>` + r.map((v, b) => cell(v, a === b)).join("") + "</tr>").join("") +
+          "</tbody></table></figure>";
+      }
+      html += "</div>";
+    }
+    document.getElementById("cm").innerHTML = html;
+    document.getElementById("cm-note").textContent =
+      `${method === "pearson" ? "Pearson" : "Spearman"} correlation, ${rg === "all" ? "all regions" : SC.regions[+rg]}. ` +
+      "Blue is positive, orange negative. Weeks are dev weeks unless holdout years are included; a week counts as dev if it ends by " + SC.dev_end + ".";
+  }
+  methodSel.addEventListener("change", drawMatrices); holdoutBox.addEventListener("change", drawMatrices);
+  regionSel.addEventListener("change", drawMatrices);
+  drawMatrices();
 })();
 </script>
 """
@@ -302,6 +367,7 @@ def main() -> None:
   --bg: #f6f7f5; --panel: #ffffff; --ink: #1b2422; --muted: #5b6764; --rule: #d9dedb;
   --accent: #0f6e63; --cap: #b4561f;
   --s1: #8a9491; --s2: #b4561f; --s3: #c99a2e; --s4: #0f6e63;
+  --pos: #2a6fb0; --neg: #c2410c;
   --k1: #2a6fb0; --k2: #c2410c; --k3: #0f8a6e; --k4: #9d3ea8; --k5: #a37a00; --k6: #5b6764;
   --display: "IBM Plex Sans Condensed", "Arial Narrow", sans-serif;
   --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
@@ -310,10 +376,12 @@ def main() -> None:
 @media (prefers-color-scheme: dark) {{ :root:not([data-theme="light"]) {{
   --bg: #121816; --panel: #1a2220; --ink: #e5ebe8; --muted: #9aa7a3; --rule: #2e3a37;
   --accent: #4fc1b0; --cap: #e88a52; --s1: #7d8a86; --s2: #e88a52; --s3: #e0b85a; --s4: #4fc1b0;
+  --pos: #4f8fd0; --neg: #e07a40;
   --k1: #6fa8e0; --k2: #f08a50; --k3: #47c4a2; --k4: #d07fdb; --k5: #e0bb45; --k6: #a3b0ac; color-scheme: dark }} }}
 :root[data-theme="dark"] {{
   --bg: #121816; --panel: #1a2220; --ink: #e5ebe8; --muted: #9aa7a3; --rule: #2e3a37;
   --accent: #4fc1b0; --cap: #e88a52; --s1: #7d8a86; --s2: #e88a52; --s3: #e0b85a; --s4: #4fc1b0;
+  --pos: #4f8fd0; --neg: #e07a40;
   --k1: #6fa8e0; --k2: #f08a50; --k3: #47c4a2; --k4: #d07fdb; --k5: #e0bb45; --k6: #a3b0ac; color-scheme: dark }}
 body {{ background: var(--bg); color: var(--ink); font: 15px/1.6 var(--body); }}
 main {{ max-width: 46rem; margin: 0 auto; padding-inline: 16px; padding-block: 40px 64px; }}
@@ -352,6 +420,16 @@ select:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 1px; }
 .tip {{ position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--rule); border-radius: 4px;
   padding: 6px 8px; font: 12px/1.4 var(--mono); box-shadow: 0 2px 8px rgb(0 0 0 / .15); white-space: nowrap; z-index: 2; }}
 .combined {{ margin-bottom: .4rem; }}
+.cm-year {{ margin: 1.1rem 0 .3rem; font: 600 .95rem var(--display); }}
+.cm-year small {{ font: 400 .8rem var(--body); color: var(--muted); margin-left: 8px; }}
+.cm-year .flag {{ color: var(--cap); }}
+.cm-row {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: 12px; }}
+.cm-row figure {{ margin: 0; min-width: 0; overflow-x: auto; }}
+.cm-row figcaption {{ font-size: .8rem; color: var(--muted); margin-bottom: 3px; }}
+table.cm {{ width: auto; font-size: .78rem; }}
+table.cm th, table.cm td {{ padding: 3px 6px; border-bottom: 0; text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }}
+table.cm th {{ font-size: .68rem; letter-spacing: 0; text-transform: none; }}
+table.cm td.self {{ color: var(--muted); }}
 .combined canvas {{ aspect-ratio: 1 / 0.62; }}
 .links {{ display: inline-flex; gap: 6px; align-items: center; font-size: .85rem; color: var(--muted); margin: 2px 0 6px; }}
 .marker {{ display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: -1px; }}
@@ -421,6 +499,20 @@ prices. Both axes are symmetric-log. 2025–26 and 2026–27 are holdout years, 
   <div class="panel"><h3>Constant scaling (for comparison)</h3><canvas id="sc-scaled" aria-label="The same scatter with prices scaled by the cap ratio"></canvas></div>
 </div>
 <p class="note" id="sc-note" style="color:var(--muted);font-size:.85rem"></p>
+
+<h2>Do the relationships hold year to year?</h2>
+<p>Correlations between the four weekly measures (one value per region-week, as in the scatter above), computed
+separately on each price set, so each map's own arbitrage values are correlated with its own price measures. One
+row per financial year, plus all years together. They follow the Region selector above. A map that preserves the
+market's structure should leave each year's pattern much as the raw prices have it, while bringing older years'
+levels toward recent ones.</p>
+<div class="controls">
+  <label for="cm-method">Correlation <select id="cm-method">
+    <option value="pearson">Pearson (values)</option><option value="spearman">Spearman (ranks)</option></select></label>
+  <label for="cm-holdout"><input type="checkbox" id="cm-holdout"> Include holdout years (2025–26 from September, 2026–27)</label>
+</div>
+<p class="note" id="cm-note" style="color:var(--muted);font-size:.85rem"></p>
+<div id="cm"></div>
 
 <h2>Year by year, raw prices</h2>
 <div class="table-wrap"><table>
