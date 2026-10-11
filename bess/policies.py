@@ -43,16 +43,27 @@ def blended_forecast(obs: Observation) -> tuple[np.ndarray, np.ndarray]:
     P5MIN covers 5-min intervals up to its last interval end L. After that,
     predispatch: first a partial step (L, next half-hour] priced at the
     predispatch period containing it, then whole 30-min periods.
+
+    AEMO's archive has the odd gap in P5MIN runs (e.g. about an hour on
+    5 September 2024). If the latest run doesn't cover the next interval, the
+    hour P5MIN would cover is priced from the predispatch periods containing
+    each of its 5-minute intervals instead.
     """
     tau, p5, pd_run = obs.tau, obs.p5min, obs.predispatch
-    if p5 is None or pd_run is None:
-        raise ValueError(f"No forecast available at {tau}")
+    if pd_run is None:
+        raise ValueError(f"No predispatch forecast available at {tau}")
 
     tau64 = np.datetime64(tau, "ns")
-    keep = p5.interval_end > tau64
-    p5_end, p5_rrp = p5.interval_end[keep], p5.rrp[keep]
-    if len(p5_end) == 0 or p5_end[0] != tau64 + np.timedelta64(INTERVAL):
-        raise ValueError(f"P5MIN run at {tau} doesn't cover the next interval")
+    nxt = tau64 + np.timedelta64(INTERVAL)
+    if p5 is not None:
+        keep = p5.interval_end > tau64
+        p5_end, p5_rrp = p5.interval_end[keep], p5.rrp[keep]
+    if p5 is None or len(p5_end) == 0 or p5_end[0] != nxt:
+        p5_end = nxt + np.arange(12) * np.timedelta64(INTERVAL)
+        i = np.searchsorted(pd_run.interval_end, p5_end)  # the period containing each interval
+        if i[0] == len(pd_run.interval_end):
+            raise ValueError(f"No forecast covers the interval after {tau}")
+        p5_end, p5_rrp = p5_end[i < len(pd_run.interval_end)], pd_run.rrp[i[i < len(pd_run.interval_end)]]
 
     last = p5_end[-1]
     keep = pd_run.interval_end > last

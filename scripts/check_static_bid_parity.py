@@ -29,8 +29,8 @@ from harness.splits import REGIONS  # noqa: E402
 
 DEV_DB = Path(__file__).resolve().parent.parent / "data" / "dev.duckdb"
 WINDOWS = [
-    (pd.Timestamp("2026-06-03 04:00"), pd.Timestamp("2026-06-06 04:00")),
-    (pd.Timestamp("2026-07-14 04:00"), pd.Timestamp("2026-07-17 04:00")),
+    (pd.Timestamp("2022-01-03 04:00"), pd.Timestamp("2022-01-06 04:00")),
+    (pd.Timestamp("2025-07-14 04:00"), pd.Timestamp("2025-07-17 04:00")),
 ]
 SHAPES = [(1, 1), (48, 1), (48, 3)]
 
@@ -41,9 +41,10 @@ def random_params(rng, shape, market) -> StaticBidParams:
     return StaticBidParams(load, gen, rng.uniform(0, 0.4, shape + (10,)), rng.uniform(0, 0.4, shape + (10,)))
 
 
-def check(config, rng, data) -> float:
+def check(config, rng) -> float:
     worst = 0.0
     for start, end in WINDOWS:
+        data = {r: load_region(r, DEV_DB, start, end) for r in REGIONS}
         ends, minutes = interval_grid(start, end)
         rrp = np.stack([data[r].actual_rrp.loc[ends].to_numpy() for r in REGIONS])
         for shape in SHAPES:
@@ -70,13 +71,12 @@ def check(config, rng, data) -> float:
 
 def main() -> None:
     config = load_config()
-    data = {r: load_region(r, DEV_DB) for r in REGIONS}
     rng = np.random.default_rng(0)
     print("default ramp rate")
-    worst = check(config, rng, data)
+    worst = check(config, rng)
     slow = dataclasses.replace(config, battery=dataclasses.replace(config.battery, ramp_rate_mw_per_min=0.07))
     print("slow ramp (0.07 MW/min: three intervals to stop from full power)")
-    worst = max(worst, check(slow, rng, data))
+    worst = max(worst, check(slow, rng))
     print(f"OK: fast simulator matches bess.sim within {worst:.1e}, every run valid")
 
 

@@ -20,9 +20,13 @@ import numpy as np
 import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "benchmark.duckdb"
+# Built by harness/build_data.py from the raw AEMO tables in data/benchmark.duckdb.
+DB_PATH = PROJECT_ROOT / "data" / "market.duckdb"
 
 INTERVAL = pd.Timedelta(minutes=5)
+# How far before a window to load forecast runs, so the latest run before its
+# first decision is there.
+FORECAST_LOOKBACK = pd.Timedelta(days=1)
 
 
 @dataclass
@@ -80,7 +84,17 @@ class RegionData:
         return self._actual_end[:n], self._actual_rrp[:n]
 
 
-def load_region(region: str, db_path: Path = DB_PATH) -> RegionData:
+def load_region(
+    region: str,
+    db_path: Path = DB_PATH,
+    start: pd.Timestamp | None = None,
+    end: pd.Timestamp | None = None,
+) -> RegionData:
+    """One region's actual prices and forecast runs. With `start`/`end`, only
+    the forecast runs a simulation of (start, end] can use are loaded (actual
+    prices are always loaded in full, as they make up the price history)."""
+    lo = pd.Timestamp.min if start is None else start - FORECAST_LOOKBACK
+    hi = pd.Timestamp.max if end is None else end
     con = duckdb.connect(str(db_path), read_only=True)
     try:
         actual = con.execute(
@@ -90,14 +104,14 @@ def load_region(region: str, db_path: Path = DB_PATH) -> RegionData:
         ).df()
         p5min = con.execute(
             """SELECT RUN_DATETIME, INTERVAL_DATETIME, RRP FROM p5min_regionsolution
-               WHERE REGIONID = ? AND INTERVENTION = 0""",
-            [region],
+               WHERE REGIONID = ? AND INTERVENTION = 0 AND RUN_DATETIME > ? AND RUN_DATETIME <= ?""",
+            [region, lo, hi],
         ).df()
         # A predispatch run's LASTCHANGED is the same for every period in it.
         predispatch = con.execute(
             """SELECT LASTCHANGED, DATETIME, RRP FROM predispatchprice
-               WHERE REGIONID = ? AND INTERVENTION = 0""",
-            [region],
+               WHERE REGIONID = ? AND INTERVENTION = 0 AND LASTCHANGED > ? AND LASTCHANGED <= ?""",
+            [region, lo, hi],
         ).df()
     finally:
         con.close()

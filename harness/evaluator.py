@@ -34,9 +34,7 @@ from bess.policies import PerfectForesight
 from bess.remote import RemotePolicy, config_from_dict, config_to_dict
 from bess.sim import simulate, summarise
 from harness.sandbox import PROJECT_ROOT, policy_sandbox
-from harness.splits import (
-    DEV_END, DEV_EPISODES, DEV_START, HOLDOUT_END, HOLDOUT_EPISODES, HOLDOUT_START, REGIONS, Window,
-)
+from harness.splits import DATA_VERSION, DEV_EPISODES, DEV_MONTHS, HOLDOUT_EPISODES, HOLDOUT_MONTHS, REGIONS, Window
 
 REFERENCE_POLICY_DIR = Path(__file__).resolve().parent / "reference_policy"
 # Further baselines, scored alongside the reference policy when their fitted
@@ -55,10 +53,10 @@ SIM_VERSION = 2  # 2: straight-line dispatch trajectory and the unit's ramp rate
 
 def config_fingerprint(config: Config) -> str:
     """Identifies everything that affects a score: the full config (battery,
-    market rules, terminal condition, ...) plus the simulator version."""
+    market rules, terminal condition, ...) plus the simulator and data versions."""
     d = config_to_dict(config)
     d.pop("name")
-    blob = json.dumps({"sim_version": SIM_VERSION, **_floats(d)}, sort_keys=True)
+    blob = json.dumps({"sim_version": SIM_VERSION, "data_version": DATA_VERSION, **_floats(d)}, sort_keys=True)
     return hashlib.sha1(blob.encode()).hexdigest()[:12]
 
 
@@ -179,7 +177,7 @@ def aggregate(jobs: list[dict]) -> dict:
 def _run_region(args) -> dict:
     config = config_from_dict(json.loads(args.config_json))
     start, end = pd.Timestamp(args.start), pd.Timestamp(args.end)
-    data = load_region(args.region, Path(args.db))
+    data = load_region(args.region, Path(args.db), start, end)
     policy_dir = Path(args.policy_dir)
     out_dir = Path(args.out_dir) if args.out_dir else None
     tag = args.tag or args.region
@@ -220,13 +218,13 @@ def _run_region(args) -> dict:
     }
 
 
-FULL_MONTH_TIMEOUT_FACTOR = 31 / 3  # a full-month job vs a 3-day episode job
+FULL_MONTH_TIMEOUT_FACTOR = 31 / 3  # a one-month job (the full holdout runs one job per month) vs a 3-day episode job
 
 REFERENCE_SETS = {
-    "dev": [(DEV_START, DEV_END)],
+    "dev": DEV_MONTHS,
     "dev_episodes": DEV_EPISODES,
     "holdout_episodes": HOLDOUT_EPISODES,  # what the agent's submissions are compared against
-    "holdout_full": [(HOLDOUT_START, HOLDOUT_END)],  # the headline comparison
+    "holdout_full": HOLDOUT_MONTHS,  # the headline comparison
 }
 
 

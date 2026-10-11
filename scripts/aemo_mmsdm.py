@@ -1,20 +1,26 @@
-"""Shared downloader for AEMO's MMSDM historical data archive.
+"""Downloader for AEMO's MMSDM historical data archive.
 
-NEMOSIS only wires up the small set of tables under the MMSDM archive's
-`DATA/` directory (DISPATCHPRICE, TRADINGPRICE, etc). P5MIN_REGIONSOLUTION
-and PREDISPATCHPRICE live under their own `P5MIN_ALL_DATA/` and
-`PREDISP_ALL_DATA/` directories and aren't supported by NEMOSIS, so this
-module replicates just enough of its download logic for those two tables.
+Each month's archive is a directory of zipped CSVs, one or more files per
+table. AEMO renamed them in August 2024:
 
-Current (post-2024) archive filenames use a literal `#` on disk, e.g.
-`PUBLIC_ARCHIVE#P5MIN_REGIONSOLUTION#ALL#FILE01#202606010000.zip`. AEMO's
-CDN also 403s requests without a browser-like User-Agent.
+- before: `PUBLIC_DVD_P5MIN_REGIONSOLUTION_ALL_202110010000.zip`
+- after:  `PUBLIC_ARCHIVE#P5MIN_REGIONSOLUTION#ALL#FILE01#202608010000.zip`
+
+so files are found by listing the month's directory rather than by building
+their names. AEMO's CDN 403s requests without a browser-like User-Agent, and
+the `#` in file names must be sent percent-escaped.
+
+The zips are kept under `data/raw_cache/`; the CSVs are extracted to a temporary
+directory, read with DuckDB, and deleted.
 """
 
+import re
+import tempfile
 import zipfile
+from functools import cache
 from pathlib import Path
 
-import pandas as pd
+import duckdb
 import requests
 
 USER_AGENT = (
@@ -28,85 +34,74 @@ session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
 
 
-def _archive_url(year: int, month: int, directory: str, filename_stub: str) -> str:
-    month_str = f"{month:02d}"
-    filename = f"{filename_stub}#{year}{month_str}010000"
-    # Literal `#` in the on-disk filename must be sent as a single
-    # percent-escape for nemweb to resolve it (not left raw, which `#`
-    # would otherwise truncate as a URL fragment).
-    filename = filename.replace("#", "%23")
-    return (
-        f"{BASE_URL}/{year}/MMSDM_{year}_{month_str}/"
-        f"MMSDM_Historical_Data_SQLLoader/{directory}/{filename}.zip"
-    )
+def _month_url(year: int, month: int, directory: str) -> str:
+    return f"{BASE_URL}/{year}/MMSDM_{year}_{month:02d}/MMSDM_Historical_Data_SQLLoader/{directory}/"
 
 
-def download_month(
-    year: int,
-    month: int,
-    directory: str,
-    filename_stub: str,
-    cache_dir: Path,
-) -> Path | None:
-    """Download and extract one month's archive zip, returning the CSV path.
+@cache
+def list_month(year: int, month: int, directory: str) -> tuple[str, ...] | None:
+    """File names in one month's archive directory (unescaped), or None if the
+    month isn't published yet."""
+    response = session.get(_month_url(year, month, directory))
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    names = re.findall(r'HREF="[^"]*/([^"/]+\.zip)"', response.text, flags=re.IGNORECASE)
+    return tuple(sorted({n.replace("%23", "#") for n in names}))
 
-    Returns None if AEMO hasn't published that month yet (404).
-    """
+
+def table_files(year: int, month: int, directory: str, table: str) -> list[str] | None:
+    """The month's file names for one AEMO table (e.g. `P5MIN_REGIONSOLUTION`),
+    in either naming scheme. None if the month isn't published."""
+    names = list_month(year, month, directory)
+    if names is None:
+        return None
+    stamp = f"{year}{month:02d}010000"
+    old = re.compile(rf"PUBLIC_DVD_{table}(_ALL)?_(FILE\d+_)?{stamp}\.zip", re.IGNORECASE)
+    new = re.compile(rf"PUBLIC_ARCHIVE#{table}(#ALL)?#FILE\d+#{stamp}\.zip", re.IGNORECASE)
+    return [n for n in names if old.fullmatch(n) or new.fullmatch(n)]
+
+
+def download(year: int, month: int, directory: str, name: str, cache_dir: Path) -> Path:
+    """Download one archive zip into `cache_dir` (skipped if already there)."""
     cache_dir.mkdir(parents=True, exist_ok=True)
-    url = _archive_url(year, month, directory, filename_stub)
-    zip_name = url.rsplit("/", 1)[-1]
-    zip_path = cache_dir / zip_name
-    csv_path = cache_dir / zip_name.replace(".zip", ".CSV").replace("%23", "#")
-
-    if csv_path.exists():
-        return csv_path
-
-    if not zip_path.exists():
-        response = session.get(url, stream=True)
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        with open(zip_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=2**16):
-                f.write(chunk)
-
-    with zipfile.ZipFile(zip_path) as z:
-        z.extractall(cache_dir)
-
-    return csv_path
+    path = cache_dir / name.replace("#", "%23")
+    if path.exists():
+        return path
+    tmp = path.with_suffix(".part")
+    response = session.get(_month_url(year, month, directory) + name.replace("#", "%23"), stream=True)
+    response.raise_for_status()
+    with open(tmp, "wb") as f:
+        for chunk in response.iter_content(chunk_size=2**20):
+            f.write(chunk)
+    tmp.rename(path)
+    return path
 
 
-def load_mmsdm_csv(csv_path: Path) -> pd.DataFrame:
-    """Parse an MMSDM CSV: skip the leading `C` metadata row, use the `I`
-    row as the header, and drop the trailing `C,END OF REPORT` footer row.
-    """
-    data = pd.read_csv(csv_path, skiprows=1, low_memory=False)
-    return data.iloc[:-1, :]
+def read_zip(con: duckdb.DuckDBPyConnection, zip_path: Path, columns: dict[str, str]) -> duckdb.DuckDBPyRelation:
+    """Read the data rows of an MMSDM CSV zip into a DuckDB relation with the
+    given {column: SQL type} (timestamps parse AEMO's `YYYY/MM/DD HH:MM:SS`).
 
-
-def download_mmsdm_table(
-    start: str,
-    end: str,
-    directory: str,
-    filename_stub: str,
-    cache_dir: Path,
-    datetime_columns: list[str],
-) -> pd.DataFrame:
-    """Download every month in [start, end) and concatenate into one frame.
-
-    `start`/`end` are 'YYYY/MM/DD' strings, `end` exclusive.
-    """
-    months = pd.date_range(start=start, end=end, freq="MS", inclusive="left")
-    frames = []
-    for ts in months:
-        csv_path = download_month(ts.year, ts.month, directory, filename_stub, cache_dir)
-        if csv_path is None:
-            print(f"SKIP {filename_stub} {ts.year}-{ts.month:02d}: not yet published")
-            continue
-        print(f"OK   {filename_stub} {ts.year}-{ts.month:02d}")
-        frames.append(load_mmsdm_csv(csv_path))
-
-    data = pd.concat(frames, axis=0, ignore_index=True)
-    for col in datetime_columns:
-        data[col] = pd.to_datetime(data[col])
-    return data
+    An MMSDM CSV is a `C` metadata row, an `I` header row, `D` data rows and a
+    `C,END OF REPORT` footer. The relation is materialised before the CSV is
+    deleted."""
+    with tempfile.TemporaryDirectory() as tmp, zipfile.ZipFile(zip_path) as z:
+        (member,) = [m for m in z.namelist() if m.upper().endswith(".CSV")]
+        csv = Path(tmp) / "table.csv"  # DuckDB mis-sniffs paths containing '#'
+        # Drop the C row, and the CRs: newer files mix \n and \r\n line ends,
+        # which DuckDB's dialect sniffer rejects.
+        with z.open(member) as src, open(csv, "wb") as dst:
+            src.readline()
+            while chunk := src.read(2**22):
+                dst.write(chunk.replace(b"\r", b""))
+        raw = con.read_csv(str(csv), header=True, all_varchar=True, null_padding=True, sep=",", quotechar='"')
+        con.register("_mmsdm_raw", raw)
+        first = raw.columns[0]
+        select = ", ".join(
+            f"try_strptime(\"{c}\", '%Y/%m/%d %H:%M:%S') AS {c}" if t == "TIMESTAMP" else f"TRY_CAST(\"{c}\" AS {t}) AS {c}"
+            for c, t in columns.items()
+        )
+        name = f"_mmsdm_{abs(hash(str(zip_path)))}"
+        con.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT {select} FROM _mmsdm_raw WHERE \"{first}\" = 'D'")
+        con.unregister("_mmsdm_raw")
+    return con.table(name)

@@ -445,12 +445,12 @@ function drawProgress(s) {
     marker: { size: 10, symbol: "x-thin-open", color: css("--critical"), line: { width: 2, color: css("--critical") } },
     hovertext: invalid.map((x) => `#${x.n} · invalid<br>${ax.fmt(x.x[xKey])}`), hoverinfo: "text" });
 
-  const ff = s.final_full_month;
+  const ff = s.final_full_holdout;
   if (ff && ff.pct_of_perfect != null && yKey === "pct") {
-    traces.push({ name: "Full month (final)", x: [nowX], y: [ff.pct_of_perfect], mode: "markers+text", text: [`full month #${ff.n}`],
+    traces.push({ name: "Full holdout (final)", x: [nowX], y: [ff.pct_of_perfect], mode: "markers+text", text: [`full holdout #${ff.n}`],
       textposition: "middle left", textfont: { color: css("--text-primary"), size: 11 },
       marker: { size: 13, symbol: "diamond", color: css("--series-2"), line: { color: css("--surface-1"), width: 2 } },
-      hovertext: [`Full holdout month, submission #${ff.n}: ${pct(ff.pct_of_perfect)}`], hoverinfo: "text" });
+      hovertext: [`Full holdout, submission #${ff.n}: ${pct(ff.pct_of_perfect)}`], hoverinfo: "text" });
   }
   const baseline = yKey === "pct" ? s.baseline_holdout_pct : s.baseline_holdout_net_revenue;
   const shapes = [], annotations = [];
@@ -480,7 +480,7 @@ function drawProgress(s) {
     ? `Best: ${best === null ? "no valid submission" : (yKey === "pct" ? pct(best) : money(best))}` +
       (pf && best !== null && yKey !== "pct" ? ` (perfect foresight ${money(pf)})` : "") +
       ". Scores are on the sampled holdout episodes. Invalid submissions earn no credit and sit at zero." +
-      (ff ? (yKey === "pct" ? " The diamond is the final submission scored on the full month." : " Switch to % to compare with the full-month final score.") : "")
+      (ff ? (yKey === "pct" ? " The diamond is the final submission scored on the full holdout." : " Switch to % to compare with the full-holdout final score.") : "")
     : "No scored submissions yet.";
 }
 
@@ -538,11 +538,11 @@ function drawCompare(data) {
     if (invalid.length) traces.push({ name: label, legendgroup: r.run_id, showlegend: false, x: invalid.map(xOf), y: invalid.map(() => 0), mode: "markers",
       marker: { size: 10, symbol: "x-thin-open", line: { width: 2, color: css("--critical") } },
       hovertext: invalid.map((sub) => `${label}<br>#${sub.n} · invalid (no credit)`), hoverinfo: "text" });
-    const ff = r.final_full_month;
+    const ff = r.final_full_holdout;
     if (ff && ff.pct_of_perfect != null && yKey === "pct") {
       traces.push({ name: label, legendgroup: r.run_id, showlegend: false, x: [endX], y: [ff.pct_of_perfect], mode: "markers",
         marker: { size: 12, symbol: "diamond", color: colour, line: { color: css("--surface-1"), width: 2 } },
-        hovertext: [`${label}<br>Full month, #${ff.n}: ${pct(ff.pct_of_perfect)}`], hoverinfo: "text" });
+        hovertext: [`${label}<br>Full holdout, #${ff.n}: ${pct(ff.pct_of_perfect)}`], hoverinfo: "text" });
       ys.push(ff.pct_of_perfect);
     }
     if (runs.length <= 4) annotations.push({ x: bx[bx.length - 1], y: best ?? 0, xanchor: "left", yanchor: "middle", showarrow: false, xshift: 6,
@@ -569,7 +569,7 @@ function drawCompare(data) {
   }, { displayModeBar: false, responsive: true });
   const hidden = data.runs.length - runs.length;
   $("compare-note").textContent = "Each line is a run's best valid holdout-episode score so far, up to the run's end (zero before its first valid submission). " +
-    "Circles are submissions; colour is the model." + (yKey === "pct" ? " Diamonds are the final submission scored on the full month." : "") +
+    "Circles are submissions; colour is the model." + (yKey === "pct" ? " Diamonds are the final submission scored on the full holdout." : "") +
     (hidden ? ` ${hidden} run(s) under older market rules are hidden; their scores aren't comparable.` : "") +
     ($("compare-old").checked && runs.some((r) => !r.comparable) ? " Dotted lines are runs under older rules, scored against a different baseline." : "");
 }
@@ -648,8 +648,8 @@ function renderStatus(s) {
     tile("Tokens", compact(tok.input_tokens + tok.cache_read_input_tokens + tok.cache_creation_input_tokens) + " in", `${compact(tok.output_tokens)} out · ${compact(tok.cache_read_input_tokens)} cache read`),
     tile("API calls", String(s.api_calls), ""),
     tile("Tool calls", String(toolCalls), Object.entries(s.tools).sort((a, b) => b[1].calls - a[1].calls).slice(0, 3).map(([k, v]) => `${k.replace("mcp__harness__", "")} ${v.calls}`).join(" · ")),
-    tile("Full month (final)", s.final_full_month ? pct(s.final_full_month.pct_of_perfect) : "–",
-      s.final_full_month ? `submission #${s.final_full_month.n}${s.final_full_month.valid ? "" : " · invalid"} · baseline ${pct(s.baseline_full_month_pct)}`
+    tile("Full holdout (final)", s.final_full_holdout ? pct(s.final_full_holdout.pct_of_perfect) : "–",
+      s.final_full_holdout ? `submission #${s.final_full_holdout.n}${s.final_full_holdout.valid ? "" : " · invalid"} · baseline ${pct(s.baseline_full_holdout_pct)}`
         : "scored after the run ends"),
     tile("Submissions", `${used} / ${max}`, s.submissions.some((x) => x.state === "evaluating") ? "evaluating…" : ""),
     tile("Final score (episodes)", pct(s.final_pct_of_perfect),

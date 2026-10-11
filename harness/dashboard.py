@@ -2,7 +2,7 @@
 
     uv run python -m harness.dashboard [--port 8050]
 
-Then open http://127.0.0.1:8050. It scrubs through the holdout month: actual
+Then open http://127.0.0.1:8050. It scrubs through the holdout: actual
 prices up to the scrub time, with the P5MIN and predispatch forecasts that
 were current at that moment ahead of it. Once the agent submits a policy,
 it also shows that submission's state of charge, dispatch and bids, plus the
@@ -27,13 +27,13 @@ import pandas as pd
 
 from bess.bid import bid_from_dict, dispatch_at_price, effective_gen_mw, effective_load_mw
 from bess.config import load_config
-from bess.data import load_region
+from bess.data import DB_PATH, load_region
 from bess.policies import PerfectForesight
 from bess.remote import config_from_dict
 from bess.sim import simulate
 from harness.evaluator import REFERENCE_DIR, REFERENCE_PATH, SIM_VERSION, config_fingerprint, load_reference
 from harness.run_agent import CONFIG_PATH, RUNS_DIR
-from harness.splits import HOLDOUT_END, HOLDOUT_EPISODES, HOLDOUT_START, REGIONS
+from harness.splits import HOLDOUT_END, HOLDOUT_EPISODES, HOLDOUT_MONTHS, HOLDOUT_START, REGIONS
 
 PAGE = Path(__file__).resolve().parent / "dashboard.html"
 LOOKBACK = pd.Timedelta(hours=12)
@@ -68,19 +68,23 @@ def _cached_per_region(build):
     return get
 
 
-region_data = _cached_per_region(load_region)
+region_data = _cached_per_region(lambda region: load_region(region, DB_PATH, HOLDOUT_START, HOLDOUT_END))
 
 
 @_cached_per_region
 def perfect_foresight(region: str) -> pd.DataFrame:
-    """Perfect-foresight SOC over the holdout month: a month-long MILP solve
-    (several seconds), so it's cached on disk per config fingerprint."""
+    """Perfect-foresight SOC over the holdout, solved one month at a time as
+    it's scored (several seconds a month), so it's cached on disk per config
+    fingerprint."""
     path = PF_CACHE_DIR / f"pf_{config_fingerprint(CONFIG)}_{region}.parquet"
     if path.exists():
         return pd.read_parquet(path)
     data = region_data(region)
-    policy = PerfectForesight(CONFIG, data.actual_rrp, HOLDOUT_START, HOLDOUT_END)
-    pf = simulate(policy, data, CONFIG, HOLDOUT_START, HOLDOUT_END).set_index("interval_end")[["energy_end_mwh"]]
+    pf = pd.concat([
+        simulate(PerfectForesight(CONFIG, data.actual_rrp, start, end), data, CONFIG, start, end)
+        .set_index("interval_end")[["energy_end_mwh"]]
+        for start, end in HOLDOUT_MONTHS
+    ])
     PF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     pf.to_parquet(path)
     return pf
@@ -206,9 +210,9 @@ def run_status(run_id: str) -> dict:
         elif kind == "final_evaluation_result":
             final_full = {k: e.get(k) for k in ("n", "valid", "pct_of_perfect", "net_revenue", "eval_seconds", "per_region", "error")}
             score = f"{e['pct_of_perfect']:.1f}%" if e.get("pct_of_perfect") is not None else "failed"
-            feed.append({"elapsed_s": e["elapsed_s"], "kind": "result", "text": f"Full-month final score for policy {e['n']}: {score}"})
+            feed.append({"elapsed_s": e["elapsed_s"], "kind": "result", "text": f"Full-holdout final score for policy {e['n']}: {score}"})
         elif kind == "final_evaluation_start":
-            feed.append({"elapsed_s": e["elapsed_s"], "kind": "submission", "text": f"Scoring policy {e['n']} on the full holdout month"})
+            feed.append({"elapsed_s": e["elapsed_s"], "kind": "submission", "text": f"Scoring policy {e['n']} on the full holdout (every month, scored separately)"})
         elif kind in ("result",):
             sdk_cost = e.get("sdk_total_cost_usd") or sdk_cost
         elif kind in ("limit_reached", "limit_deferred", "finish", "prompt", "pause", "resume", "session_error", "run_resumed"):
@@ -233,7 +237,7 @@ def run_status(run_id: str) -> dict:
     other_baselines = _other_baselines(reference)
 
     # Where the run's x-axes end. A live run keeps growing; once the agent has
-    # stopped, every axis freezes at that moment. The full-month final
+    # stopped, every axis freezes at that moment. The full-holdout final
     # evaluation runs after the agent stops, so it mustn't stretch the axes.
     agent_end = next((e for e in events if e["event"] in ("final_evaluation_start", "run_end")), None)
     stopped = bool(end is None and stale and not state.get("paused_until"))
@@ -276,9 +280,9 @@ def run_status(run_id: str) -> dict:
         "submissions": sorted(submissions.values(), key=lambda s: s["n"]),
         "final_pct_of_perfect": valid[-1]["pct_of_perfect"] if valid else None,
         "baseline_holdout_pct": holdout_ref.get("pct_of_perfect"),
-        "baseline_full_month_pct": full_ref.get("pct_of_perfect"),
+        "baseline_full_holdout_pct": full_ref.get("pct_of_perfect"),
         "other_baselines": other_baselines,
-        "final_full_month": final_full,
+        "final_full_holdout": final_full,
         "feed": feed[-80:],
     }
 
@@ -294,7 +298,7 @@ def _other_baselines(reference: dict | None) -> list[dict]:
     return [
         {"name": name, "holdout_pct": e["holdout_episodes"].get("pct_of_perfect"),
          "holdout_net_revenue": e["holdout_episodes"].get("net_revenue"),
-         "full_month_pct": e.get("holdout_full", {}).get("pct_of_perfect")}
+         "full_holdout_pct": e.get("holdout_full", {}).get("pct_of_perfect")}
         for name, e in (others or {}).items() if "holdout_episodes" in e
     ]
 
@@ -314,8 +318,8 @@ def compare_runs() -> dict:
         runs.append({
             "run_id": run_id, "model": s["model"], "running": s["running"], "comparable": fingerprint == current,
             "started": next((e["t"] for e in run_events(run_id)), None),
-            **{k: s[k] for k in ("submissions", "now_x", "axes_frozen", "final_full_month",
-                                 "baseline_holdout_pct", "baseline_holdout_net_revenue", "baseline_full_month_pct",
+            **{k: s[k] for k in ("submissions", "now_x", "axes_frozen", "final_full_holdout",
+                                 "baseline_holdout_pct", "baseline_holdout_net_revenue", "baseline_full_holdout_pct",
                                  "other_baselines")},
         })
     return {"fingerprint": current, "runs": runs}
@@ -362,15 +366,14 @@ def _intervals(path: Path, mtime: float) -> pd.DataFrame:
 
 
 def _results_file(run_id: str, n: int, region: str, tau: pd.Timestamp) -> tuple[Path | None, str]:
-    """The interval-results file covering decision time tau: the full-month
-    final eval if it exists (complete), else the episode containing tau."""
+    """The interval-results file covering decision time tau: the month of the
+    full-holdout final eval containing it if that exists (complete), else the
+    episode containing tau."""
     snap = RUNS_DIR / run_id / "submissions" / f"{n:02d}"
-    for path, source in [
-        (snap / "eval_full" / f"{region}_ep0_intervals.parquet", "full month"),
-        (snap / "eval" / f"{region}_intervals.parquet", "full month"),  # runs from before episodes
-    ]:
-        if path.exists():
-            return path, source
+    for k, (start, end) in enumerate(HOLDOUT_MONTHS):
+        path = snap / "eval_full" / f"{region}_ep{k}_intervals.parquet"
+        if start <= tau < end and path.exists():
+            return path, f"full holdout, {start + pd.Timedelta(days=1):%B %Y}"
     for k, (start, end) in enumerate(HOLDOUT_EPISODES):
         if start <= tau < end:
             path = snap / "eval" / f"{region}_ep{k}_intervals.parquet"

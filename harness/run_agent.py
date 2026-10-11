@@ -75,7 +75,7 @@ from harness.evaluator import (
     FULL_MONTH_TIMEOUT_FACTOR, baseline_pcts, config_fingerprint, evaluate, load_reference, update_reference,
 )
 from harness.sandbox import PROJECT_ROOT, write_agent_cli_wrapper
-from harness.splits import HOLDOUT_END, HOLDOUT_EPISODES, HOLDOUT_START
+from harness.splits import DEV_EPISODES, HOLDOUT_EPISODES, HOLDOUT_MONTHS
 
 RUNS_DIR = PROJECT_ROOT / "runs"
 TOKEN_FILE = Path.home() / ".config" / "storage-benchmark" / "claude_oauth_token"
@@ -109,7 +109,7 @@ class Policy:
 SUBMIT_POLICY_DESCRIPTION = (
     "Score the policy currently in the workspace (policy.py plus helper files) on the sampled holdout "
     "episodes. Takes a few minutes. Limited submissions; your final submission is your last valid one, "
-    "and it is also scored on the whole holdout month after the run. "
+    "and it is also scored on the whole holdout period after the run. "
     "`summary`: a short description of what the policy does (how it forms bids, how it manages state "
     "of charge). `rationale`: why you expect this approach to work, and what you changed since your "
     "last submission and why."
@@ -251,6 +251,7 @@ class Run:
             baseline_dev_pct=dev_ref["pct_of_perfect"],
             baseline_dev_episodes_pct=self.reference["dev_episodes"]["pct_of_perfect"],
             n_episodes=len(HOLDOUT_EPISODES),
+            n_dev_episodes=len(DEV_EPISODES),
             ramp_rate=self.config.battery.ramp_rate_mw_per_min,
         )
         (self.workspace / "TASK.md").write_text(task)
@@ -597,21 +598,21 @@ class Run:
                 + self.status_text())
 
     async def final_evaluation(self) -> dict | None:
-        """Score the final submission on the whole holdout month: the headline
+        """Score the final submission on the whole holdout, one job per month: the headline
         result. Runs after the agent is done, outside its budget; skipped if
         already done (e.g. on --resume of an ended run)."""
         final = self.final_submission()
         if final is None:
             return None
         snap_dir = self.submissions_dir / f"{final['n']:02d}"
-        path = snap_dir / "result_full_month.json"
+        path = snap_dir / "result_full_holdout.json"
         if path.exists():
             return json.loads(path.read_text())
         self.log.event("final_evaluation_start", n=final["n"])
-        print(f"Scoring submission {final['n']} on the full holdout month...", flush=True)
+        print(f"Scoring submission {final['n']} on the full holdout...", flush=True)
         t0 = time.time()
         result = await asyncio.to_thread(
-            evaluate, snap_dir / "policy", self.config, [(HOLDOUT_START, HOLDOUT_END)],
+            evaluate, snap_dir / "policy", self.config, HOLDOUT_MONTHS,
             sandboxed=True, timeout_s=self.args.eval_timeout * FULL_MONTH_TIMEOUT_FACTOR,
             out_dir=snap_dir / "eval_full",
         )
@@ -626,7 +627,7 @@ class Run:
 
     def write_summary(self) -> None:
         final = self.final_submission()
-        full_path = self.submissions_dir / f"{final['n']:02d}" / "result_full_month.json" if final else None
+        full_path = self.submissions_dir / f"{final['n']:02d}" / "result_full_holdout.json" if final else None
         full = json.loads(full_path.read_text()) if full_path and full_path.exists() else None
         summary = {
             "run_id": self.run_id,
@@ -654,9 +655,9 @@ class Run:
             "final_submission": final["n"] if final else None,
             "final_pct_of_perfect": final["result"]["pct_of_perfect"] if final else None,
             "baseline_holdout_episodes_pct_of_perfect": self.reference["holdout_episodes"]["pct_of_perfect"],
-            "final_full_month_pct_of_perfect": full.get("pct_of_perfect") if full else None,
-            "final_full_month_valid": full.get("valid") if full else None,
-            "baseline_full_month_pct_of_perfect": self.reference["holdout_full"]["pct_of_perfect"],
+            "final_full_holdout_pct_of_perfect": full.get("pct_of_perfect") if full else None,
+            "final_full_holdout_valid": full.get("valid") if full else None,
+            "baseline_full_holdout_pct_of_perfect": self.reference["holdout_full"]["pct_of_perfect"],
             "baselines": {s: baseline_pcts(self.reference, s) for s in ("holdout_episodes", "holdout_full")},
             "agent_summary": self.agent_summary,
         }
@@ -666,7 +667,7 @@ class Run:
         (self.dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
         self.log.event("run_end", **{k: summary[k] for k in [
             "ended_by", "wall_seconds", "active_seconds", "cost_usd", "final_pct_of_perfect",
-            "final_full_month_pct_of_perfect"]})
+            "final_full_holdout_pct_of_perfect"]})
         print(json.dumps(summary, indent=2, default=str))
 
 

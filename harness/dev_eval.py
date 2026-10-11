@@ -1,11 +1,13 @@
 """Score a policy on the development data (run this from the agent workspace).
 
-    python -m harness.dev_eval --quick [--regions SA1 VIC1]
-    python -m harness.dev_eval [--policy-dir .] [--regions SA1 VIC1] [--start 2026-07-01] [--end 2026-07-08]
+    python -m harness.dev_eval [--regions SA1 VIC1]                  # sampled 3-day dev episodes
+    python -m harness.dev_eval --start 2025-07-01 --end 2025-07-08   # one window
+    python -m harness.dev_eval --full                                # every dev month
 
-Uses ./data/dev.duckdb (June-July 2026). --quick scores on sampled 3-day dev
-episodes (chosen like the holdout episodes) in parallel; otherwise one
-continuous window. Prints each region's net revenue and % of perfect
+Uses ./data/dev.duckdb (October 2021 to August 2025). By default it scores on
+sampled 3-day dev episodes (chosen like the holdout episodes) in parallel;
+--start/--end give one continuous window instead, and --full every dev month,
+each a separate window. Prints each region's net revenue and % of perfect
 foresight, and the total. Per-interval results (bids rejected, MW, prices,
 revenue) are written to ./dev_results/<region>_ep<k>_intervals.parquet, and
 anything the policy prints goes to ./dev_results/<region>_ep<k>_stderr.log.
@@ -19,25 +21,34 @@ import pandas as pd
 
 from bess.config import load_config
 from harness.evaluator import evaluate
-from harness.splits import DEV_END, DEV_EPISODES, DEV_START, REGIONS
+from harness.splits import DEV_END, DEV_EPISODES, DEV_MONTHS, DEV_START, EXCLUDED, REGIONS, excluded_overlap
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--policy-dir", default=".")
-    parser.add_argument("--quick", action="store_true", help=f"score on {len(DEV_EPISODES)} sampled 3-day dev episodes")
+    parser.add_argument("--full", action="store_true", help=f"score on all {len(DEV_MONTHS)} dev months (slow)")
     parser.add_argument("--regions", nargs="+", default=REGIONS, choices=REGIONS)
-    parser.add_argument("--start", default=str(DEV_START), help="window start (exclusive), >= 2026-06-01 04:05")
-    parser.add_argument("--end", default=str(DEV_END), help="window end (inclusive), <= 2026-08-01 00:00")
+    parser.add_argument("--start", help=f"window start (exclusive), >= {DEV_START}")
+    parser.add_argument("--end", help=f"window end (inclusive), <= {DEV_END}")
     parser.add_argument("--db", default="data/dev.duckdb")
     parser.add_argument("--config", default="config.toml")
     parser.add_argument("--out-dir", default="dev_results")
     parser.add_argument("--timeout", type=float, default=3600, help="seconds per (region, window) job")
     args = parser.parse_args()
 
-    start, end = pd.Timestamp(args.start), pd.Timestamp(args.end)
-    if start < DEV_START or end > DEV_END or start >= end:
-        parser.error(f"window must lie within ({DEV_START}, {DEV_END}]")
-    windows = DEV_EPISODES if args.quick else [(start, end)]
+    window = args.start is not None or args.end is not None
+    if window:
+        if args.full:
+            parser.error("--full and --start/--end don't combine")
+        if args.start is None or args.end is None:
+            parser.error("give both --start and --end")
+        start, end = pd.Timestamp(args.start), pd.Timestamp(args.end)
+        if start < DEV_START or end > DEV_END or start >= end:
+            parser.error(f"window must lie within ({DEV_START}, {DEV_END}]")
+        if excluded_overlap(start, end):
+            parser.error(f"window overlaps an excluded period (market suspension): {EXCLUDED}")
+    windows = [(start, end)] if window else DEV_MONTHS if args.full else DEV_EPISODES
+    episodes = not window
 
     result = evaluate(
         Path(args.policy_dir), load_config(args.config), windows,
@@ -45,7 +56,7 @@ if __name__ == "__main__":
         timeout_s=args.timeout, out_dir=Path(args.out_dir),
     )
     for r in result["jobs"]:
-        label = f"{r['region']} episode {r['episode']} ({r['window'][0][:10]})" if args.quick else r["region"]
+        label = f"{r['region']} window {r['episode']} ({r['window'][0][:10]})" if episodes else r["region"]
         if "error" in r:
             print(f"{label}: ERROR {r['error']}")
         else:
@@ -67,13 +78,13 @@ if __name__ == "__main__":
         print(f"TOTAL: failed: {result['error']}")
     print(f"({result['eval_seconds']:.0f}s)")
 
-    if args.quick:
+    if episodes:
         for region, pct in result.get("per_region_pct", {}).items():
-            print(f"  {region} across episodes: {pct:.1f}%")
+            print(f"  {region} across windows: {pct:.1f}%")
     reference = Path("reference_dev.json")
     if reference.exists() and sorted(args.regions) == sorted(REGIONS):
         ref = json.loads(reference.read_text())
-        if args.quick and "episodes_pct_of_perfect" in ref:
+        if not window and not args.full and "episodes_pct_of_perfect" in ref:
             print(f"Baseline (milp_forecast) on the same dev episodes: {ref['episodes_pct_of_perfect']:.1f}%")
-        elif not args.quick and (start, end) == (DEV_START, DEV_END):
-            print(f"Baseline (milp_forecast) on the full dev window: {ref['pct_of_perfect']:.1f}%")
+        elif args.full:
+            print(f"Baseline (milp_forecast) on every dev month: {ref['pct_of_perfect']:.1f}%")

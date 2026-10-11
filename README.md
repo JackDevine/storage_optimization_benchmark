@@ -11,40 +11,32 @@ uv sync
 ## Pulling data
 
 ```
-uv run scripts/pull_dispatch_price.py          # DISPATCHPRICE (actual, 5-min) via NEMOSIS
-uv run scripts/pull_dispatch_regionsum.py      # DISPATCHREGIONSUM (actual demand/UIGF, 5-min) via NEMOSIS
-uv run scripts/pull_forecast_prices.py         # P5MIN_REGIONSOLUTION, PREDISPATCHPRICE, PREDISPATCHREGIONSUM
+uv run scripts/pull_data.py                 # raw AEMO tables, October 2021 to the latest published month
+uv run python -m harness.build_data         # data/market.duckdb (normalised prices) and data/dev.duckdb
+uv run python scripts/price_cap_analysis.py # optional: the analysis behind the price-cap mapping
 ```
 
-All three load straight into `data/benchmark.duckdb` (one table per AEMO table, e.g. `dispatchprice`,
-`dispatchregionsum`, `p5min_regionsolution`, `predispatchprice`, `predispatchregionsum`). AEMO's raw downloads
-are kept under `data/raw_cache/`. Neither directory is committed — see `.gitignore`.
+- **`scripts/pull_data.py`** downloads AEMO's MMSDM monthly archive (`scripts/aemo_mmsdm.py`) into
+  `data/benchmark.duckdb`, keeping only the columns the benchmark uses:
+  - `dispatchprice`: actual 5-minute prices, with the administered-pricing (`APCFLAG`) and market-suspension flags
+  - `p5min_regionsolution`: P5MIN forecast runs
+  - `predispatchprice`: predispatch forecast runs
+  - `market_price_thresholds`: the market price cap (`VOLL`), floor and administered price threshold by date
 
-NEMOSIS doesn't support the P5MIN/PREDISPATCH forecast tables (the maintainer points to a sister package,
-NEMSEER, instead — see https://github.com/UNSW-CEEM/NEMOSIS/issues/32). We're using our own small downloader
-(`scripts/aemo_mmsdm.py`) for those rather than taking on NEMSEER's GPLv3 license.
+  It starts at 1 October 2021, the start of 5-minute settlement. Loading is incremental: the `_loaded` table records
+  each (table, month), so a rerun fetches only new months. The zips are kept in `data/raw_cache/` (about 7 GB for
+  five years); the CSVs are extracted to a temporary directory and deleted. AEMO renamed its archive files in
+  August 2024, so files are found by listing each month's directory.
+- **`harness.build_data`** writes `data/market.duckdb`, which the simulator and evaluator read, with every price
+  mapped onto today's market price cap (`bess/normalise.py`), and its dev subset `data/dev.duckdb`, which is all an
+  agent gets. `dispatchprice.RRP_RAW` keeps the original price.
+- **The price-cap mapping.** The cap has risen every July, from $15,100/MWh in October 2021 to $23,200. Prices up to
+  a knee ($300) are unchanged; above it, g(p) = k + (MPC_now − k)·((p − k)/(MPC_then − k))^γ, so each period's cap
+  lands on today's. The data is currently built with γ = 1 (a linear stretch of the tail). Actual prices use the cap in
+  force when the interval started, forecasts the cap when the forecast ran. `scripts/price_cap_analysis.py`
+  compares this with other maps.
 
-## Data caching — know this before debugging a "why is this stale/missing" issue
-
-`data/raw_cache/` is **not uniform** — the file formats present depend on which tool wrote them, and the cache
-only applies to the *download* step, not to what ends up in DuckDB:
-
-- **Our downloader** (`aemo_mmsdm.py`, used for the forecast tables) keeps the original `.zip` plus the
-  extracted `.CSV`. No parquet — it re-parses the CSV with pandas on every run.
-- **NEMOSIS** (used for `dispatchprice`/`dispatchregionsum`) keeps `.CSV` + `.parquet` by default
-  (`keep_csv=True`); this version of NEMOSIS has no `keep_zip` option, so the zip is always deleted after
-  extraction. The `.parquet` file is what NEMOSIS actually checks to decide whether to skip re-downloading a
-  month — the `.CSV` sitting next to it is an unused byproduct, not load-bearing.
-- Both tools skip re-hitting AEMO's servers if the relevant month's file already exists locally — this is a
-  real, useful cache (confirmed empirically: re-running a pull script after the first time only attempts the
-  network for months not yet downloaded).
-- **The DuckDB write is not cached.** Every pull script does `CREATE OR REPLACE TABLE` — it always re-parses
-  whatever's in `raw_cache/` and rebuilds the table from scratch, even if nothing changed. Extending a date
-  range re-downloads only the new months but still reprocesses and rewrites the *entire* table, not just the
-  new rows. There's no incremental append and no "already loaded, skip" check at the DuckDB layer.
-
-If you add a new table/puller, don't assume raw_cache's file mix will look the same as an existing one — it's
-an artifact of which library wrote it and what's been manually cleaned up since, not a deliberate convention.
+None of `data/` is committed (see `.gitignore`).
 
 ## Dispatch benchmark
 
@@ -172,16 +164,21 @@ A model is asked to write a bidding policy. There are two backends, picked by th
     back unmodified on later calls.
   - When the prompt nears the model's context window, the oldest tool outputs are elided.
 
-- **Split** (`harness/splits.py`): the agent develops on June–July 2026 (`data/dev.duckdb`, exported from the main
-  DB with only what was published by the end of July). It's scored on August 2026, all five regions.
-  *Work in progress:* this split will change once much more data is downloaded. That also needs old prices adjusted
-  to the current market price cap without distorting them.
-- **Episodes:** submissions are scored on a seeded sample of 3-day episodes (`sample_episodes`, one per week of
-  the holdout window), each starting at 04:00 with the battery at 50%. All region × episode jobs run in parallel,
-  so a submission takes about one episode's simulated time, not a month's.
-  - After the run ends, the final valid submission is also scored on the **whole holdout month**
-    (`summary.json` → `final_full_month_pct_of_perfect`). That's the headline result.
-  - `dev_eval --quick` uses the same sampling over the dev window.
+- **Split** (`harness/splits.py`): the agent develops on October 2021 – August 2025 (`data/dev.duckdb`, with only
+  what was published by the end of August 2025). It's scored on September 2025 – August 2026, all five regions.
+  Prices are mapped onto today's cap (see *Pulling data*).
+  - **Excluded:** the June 2022 market suspension (trading days 12–23 June) and October 2022, which has no
+    predispatch runs in AEMO's archive.
+  - **Monthly windows:** long periods are scored one calendar month at a time (`month_windows`), each starting
+    the battery at 50%, so every (region, month) is a short parallel job and perfect foresight stays a
+    month-sized MILP. The dev reference set is every dev month; the full holdout is every holdout month.
+- **Episodes:** submissions are scored on a seeded sample of 3-day episodes (`sample_episodes`), one per holdout
+  month (12), each starting at 04:00 with the battery at 50%. All region × episode jobs run in parallel, so a
+  submission takes about one episode's simulated time.
+  - After the run ends, the final valid submission is also scored on the **full holdout**, month by month
+    (`summary.json` → `final_full_holdout_pct_of_perfect`). That's the headline result.
+  - `dev_eval` (no arguments) uses the same sampling over the dev period, one episode per four months (14).
+    `--full` scores every dev month.
 - **Task** (`harness/task.md`, copied into the workspace as `TASK.md`): write `policy.py` with
   `Policy(config, region).decide(obs) -> BDUBid`. `obs` is a `bess.observation.Observation` holding the latest
   P5MIN and predispatch runs, past actual prices and the battery state.
@@ -222,11 +219,11 @@ A model is asked to write a bidding policy. There are two backends, picked by th
   - `submissions/NN/`: the snapshot, evaluation outputs and `result.json` for each submission.
   - `summary.json`: totals and the final score. `cost_usd` is the API-equivalent cost for Claude runs and the
     billed cost for OpenRouter runs (`billing` says which).
-- **Dashboard** (`harness/dashboard.py` + `dashboard.html`): scrubs through the holdout month.
+- **Dashboard** (`harness/dashboard.py` + `dashboard.html`): scrubs through the holdout.
   - Price panel: actual prices up to the scrub time, plus the P5MIN and predispatch runs that were current then.
   - Once a submission has been scored, the panels beneath show its state of charge (against perfect foresight's)
     and its dispatch. A side panel shows the bid for the next interval.
   - Run stats (wall time, tokens, API-equivalent cost, tool calls) and the agent's activity refresh every 5 s.
   - Each submission shows the agent's summary and rationale, its reasoning leading up to it, and the code.
-  - URL parameters: `?region=VIC1&tau=2026-08-12T08:30&run=<id>`.
+  - URL parameters: `?region=VIC1&tau=2026-02-12T08:30&run=<id>`.
   - It serves holdout data on 127.0.0.1, so keep it out of the agent's reach. The agent's bash has no network.

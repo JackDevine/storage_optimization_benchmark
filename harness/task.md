@@ -2,13 +2,14 @@
 
 Write a Python policy that operates a battery in Australia's National Electricity Market (NEM). Every 5 minutes it
 receives the latest market price forecasts and the battery's state, and returns an energy bid for the next 5-minute
-interval. Your goal is to **maximise net revenue on a holdout period you can't see**: the calendar month that follows
-your development data, in all five NEM regions (NSW1, QLD1, SA1, TAS1, VIC1).
+interval. Your goal is to **maximise net revenue on a holdout period you can't see**: the twelve months that follow
+your development data (September 2025 to August 2026), in all five NEM regions (NSW1, QLD1, SA1, TAS1, VIC1).
 
-Submissions are scored on a fixed, undisclosed sample of **{n_episodes} three-day episodes** from the holdout month,
-in every region. Each episode starts at a trading-day boundary (04:00) with the battery at 50%. After the run ends,
-your final submission is also scored on the **whole holdout month**, and that is the reported result. Don't tune
-for 3-day horizons specifically.
+Submissions are scored on a fixed, undisclosed sample of **{n_episodes} three-day episodes** from the holdout, one
+per calendar month, in every region. Each episode starts at a trading-day boundary (04:00) with the battery at 50%.
+After the run ends, your final submission is also scored on the **whole holdout**, one calendar month at a time
+(each month starting the battery at 50%), and that is the reported result. Don't tune for 3-day horizons
+specifically.
 
 ## The battery and the market
 
@@ -87,21 +88,36 @@ One `Policy` instance is created per region and called once per interval, in tim
   It covers about 1 hour in 5-minute steps, and its first interval ending after `tau` is the one you're bidding for.
 - `predispatch`: the latest 30-minute pre-dispatch run, covering 30-minute periods out to the end of the next trading
   day.
-- `history_end`, `history_rrp`: actual prices for every interval that has already ended. In the holdout this includes
-  the whole development period.
+- `history_end`, `history_rrp`: actual prices for every interval that has already ended, from October 2021. In the
+  holdout this includes the whole development period.
 
-These forecasts are AEMO's own. They are often wrong, especially around price spikes.
+These forecasts are AEMO's own. They are often wrong, especially around price spikes. AEMO's archive also has
+occasional gaps, so the latest run can be stale: e.g. there are no P5MIN runs from 13:25 to 14:30 on 5 September 2024.
 
 ## Data and tools
 
-- `data/dev.duckdb`: development data, from 1 June 2026 04:05 to 1 August 2026 00:00. Tables:
-  - `dispatchprice` (actual RRP)
+- `data/dev.duckdb`: development data, from 1 October 2021 04:05 (the start of 5-minute settlement) to 1 September
+  2025 00:00. Tables:
+  - `dispatchprice` (actual RRP; `APCFLAG` = 1 marks administered pricing, `RRP_RAW` is explained below)
   - `p5min_regionsolution` (P5MIN runs)
   - `predispatchprice` (predispatch runs)
-  Load a region with `bess.data.load_region(region, Path("data/dev.duckdb"))`.
-- `python -m harness.dev_eval [--regions ...] [--start ...] [--end ...]` scores `policy.py` on the dev data. It prints
-  net revenue and % of perfect foresight per region, and writes per-interval results to `dev_results/`. A full run of
-  5 regions × 2 months takes a few minutes for an MILP-per-interval policy. Use short windows to iterate quickly.
+  - `market_price_thresholds` (AEMO's history of the market price cap, `VOLL`, and floor)
+  Load a region with `bess.data.load_region(region, Path("data/dev.duckdb"))`, or pass `start`/`end` to load only
+  the forecast runs for one window, which is much faster.
+- **Prices are mapped onto today's cap.** The market price cap has risen every July, from $15,100/MWh in 2021 to
+  $23,200 now. Every price in the data (actual and forecast, dev and holdout) from a period with a lower cap has
+  been mapped onto $23,200: prices up to $300/MWh are unchanged, and above that they're stretched linearly so the
+  period's cap lands on $23,200 (`bess.normalise`). `dispatchprice.RRP_RAW` is the original price.
+- Two periods are excluded from scoring and from the episodes: the June 2022 market suspension (trading days 12–23
+  June 2022), and October 2022, for which AEMO's archive has no predispatch runs (`predispatchprice` has none then).
+- `python -m harness.dev_eval` scores `policy.py` on the dev data. It prints net revenue and % of perfect foresight per
+  region, and writes per-interval results to `dev_results/`.
+  - By default it scores a sample of {n_dev_episodes} three-day dev episodes, chosen the same way as the holdout
+    episodes, in parallel. The baseline scores **{baseline_dev_episodes_pct:.1f}%** on them.
+  - `--start ... --end ...` scores one continuous window instead. Use short windows to iterate quickly.
+  - `--full` scores every dev month (each from 50%). That's 48 months × 5 regions, so it's slow: hours for an
+    MILP-per-interval policy.
+  - `--regions` limits any of these to some regions.
 - The `bess` package is read-only source you can import and read. `python -c "import bess; print(bess.__path__)"`
   prints its location, and `harness/` sits beside it. It contains:
   - the simulator (`sim.py`)
@@ -115,8 +131,6 @@ These forecasts are AEMO's own. They are often wrong, especially around price sp
   their dev scores flatter them.
 - Python libraries: numpy, pandas, duckdb, highspy, pyarrow. There is no network access, so you can't install
   anything else.
-- `python -m harness.dev_eval --quick` scores on a sample of 3-day dev episodes chosen the same way as the holdout
-  episodes, which is much faster than the full dev window. Its baseline is **{baseline_dev_episodes_pct:.1f}%**.
 - The `submit_policy` tool scores the current workspace on the **holdout episodes** and tells you:
   - total net revenue
   - % of perfect foresight across all regions
@@ -137,4 +151,4 @@ You have **{max_hours} hours** of working time and **${max_cost_usd}** of model 
 run stops and your last valid submission stands. Develop and test against the dev data, submit when an idea is ready,
 and use the feedback to decide what to try next.
 
-The baseline scores **{baseline_dev_pct:.1f}%** of perfect foresight on the full dev window.
+The baseline scores **{baseline_dev_pct:.1f}%** of perfect foresight over every dev month.

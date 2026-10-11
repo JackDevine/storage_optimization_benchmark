@@ -4,7 +4,10 @@ for the same (config, policy, region).
 
 Usage:
     uv run scripts/run_benchmark.py [--config config/default.toml] [--regions SA1 NSW1 ...]
-        [--policies milp_bid_curve ...] [--jobs 5]
+        [--policies milp_bid_curve ...] [--jobs 5] [--start 2025-08-01] [--end 2025-09-01]
+
+The window defaults to the last dev month (harness/splits.py); perfect
+foresight solves it as one MILP, so keep windows to a few months.
 """
 
 import argparse
@@ -15,20 +18,11 @@ import duckdb
 import pandas as pd
 
 from bess.config import DEFAULT_CONFIG_PATH, load_config
-from bess.data import DB_PATH, INTERVAL, load_region
+from bess.data import DB_PATH, load_region
 from bess.policies import MILPBidCurvePolicy, MILPForecastPolicy, PerfectForesight
 from bess.sim import simulate, summarise
-
-REGIONS = ["NSW1", "QLD1", "SA1", "TAS1", "VIC1"]
+from harness.splits import DEV_MONTHS, REGIONS
 POLICIES = ["milp_forecast", "milp_bid_curve", "perfect_foresight"]
-
-
-def simulation_window(data) -> tuple[pd.Timestamp, pd.Timestamp]:
-    """From the first decision time where both P5MIN and predispatch are
-    available, to the last interval with an actual price."""
-    view = data.view
-    first = max(pd.Timestamp(view._p5_runs[0]), pd.Timestamp(view._pd_runs[0]))
-    return first.ceil(INTERVAL), data.actual_rrp.index.max()
 
 
 def write_results(
@@ -51,12 +45,13 @@ def write_results(
         con.close()
 
 
-def run_region(config_path: str, region: str, policy_names: list[str]) -> list[tuple[str, pd.DataFrame, dict]]:
+def run_region(
+    config_path: str, region: str, policy_names: list[str], start: pd.Timestamp, end: pd.Timestamp,
+) -> list[tuple[str, pd.DataFrame, dict]]:
     """Simulate the named policies for one region. Runs in a worker process,
     so it returns results rather than writing to DuckDB."""
     config = load_config(config_path)
-    data = load_region(region)
-    start, end = simulation_window(data)
+    data = load_region(region, DB_PATH, start, end)
     factories = {
         "milp_forecast": lambda: MILPForecastPolicy(config),
         "milp_bid_curve": lambda: MILPBidCurvePolicy(config),
@@ -92,13 +87,16 @@ if __name__ == "__main__":
     parser.add_argument("--regions", nargs="+", default=REGIONS)
     parser.add_argument("--policies", nargs="+", default=POLICIES, choices=POLICIES)
     parser.add_argument("--jobs", type=int, default=1, help="regions to simulate in parallel")
+    parser.add_argument("--start", default=str(DEV_MONTHS[-1][0]), help="window start (exclusive)")
+    parser.add_argument("--end", default=str(DEV_MONTHS[-1][1]), help="window end (inclusive)")
     args = parser.parse_args()
+    start, end = pd.Timestamp(args.start), pd.Timestamp(args.end)
 
     config_name = load_config(args.config).name
     summaries = []
     with ProcessPoolExecutor(max_workers=args.jobs) as pool:
         futures = {
-            pool.submit(run_region, str(args.config), region, args.policies): region for region in args.regions
+            pool.submit(run_region, str(args.config), region, args.policies, start, end): region for region in args.regions
         }
         for future in as_completed(futures):
             region = futures[future]

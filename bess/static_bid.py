@@ -184,13 +184,17 @@ def simulate_static(
     gen_mw: np.ndarray,
     config: Config,
     detail: bool = False,
+    valid: np.ndarray | None = None,
 ):
-    """Net revenue of K candidate static bids in R regions over T intervals.
+    """Net revenue of K candidate static bids in R lanes (regions, or region
+    and window pairs) over T intervals.
 
     rrp: (R, T) actual prices; minute_of_day: (T,) decision time of each interval;
     load_prices, gen_prices: (K, R, 10) connection-point prices; load_mw,
-    gen_mw: (K, R, blocks, soc_bins, 10). Every region starts at the initial SOC
-    and 0 MW. Returns net revenue (K, R), or with `detail` also the MW and
+    gen_mw: (K, R, blocks, soc_bins, 10). Every lane starts at the initial SOC
+    and 0 MW. `valid` (R, T) marks the intervals each lane simulates; elsewhere
+    (padding, so windows of different lengths share one time axis) its state
+    stands still. Returns net revenue (K, R), or with `detail` also the MW and
     energy paths (K, R, T).
 
     Follows bess/sim.py step for step for these bids: the stopping-safe
@@ -209,8 +213,8 @@ def simulate_static(
     # How many gen bands clear (a prefix from band 1) and how many load bands
     # (a suffix down from band 10) at each interval's price: (T, K, R).
     gen_rrn, load_rrn = gen_prices / m.gen_mlf, load_prices / m.load_mlf
-    n_gen = np.zeros((T, K, R), np.int64)
-    n_load = np.zeros((T, K, R), np.int64)
+    n_gen = np.zeros((T, K, R), np.int8)
+    n_load = np.zeros((T, K, R), np.int8)
     price = rrp.T[:, None, :]  # (T, 1, R)
     for i in range(N_BANDS):
         n_gen += gen_rrn[None, :, :, i] <= price
@@ -229,6 +233,7 @@ def simulate_static(
     net = np.zeros((K, R))
     paths = (np.empty((K, R, T)), np.empty((K, R, T))) if detail else None
     for t in range(T):
+        energy_before = energy
         load_avail, gen_avail = max_avails(energy, mw, b, dt_h)
         offset = soc_bin(energy, b, bins) * (N_BANDS + 1)
         g = np.take_along_axis(gen_cum[block[t]], (offset + n_gen[t])[..., None], -1)[..., 0]
@@ -243,7 +248,13 @@ def simulate_static(
         neg = np.where(cross, np.where(p0 > 0, -p1 * (1 - f), -p0 * f), np.maximum(-(p0 + p1), 0.0))
         discharged, charged = pos / 2 * dt_h, neg / 2 * dt_h
         energy = energy - discharged / b.discharge_eff + charged * b.charge_eff
-        net += (discharged - charged) * rrp[:, t] - (discharged + charged) * b.degradation_cost
+        step = (discharged - charged) * rrp[:, t] - (discharged + charged) * b.degradation_cost
+        if valid is not None and not valid[:, t].all():
+            v = valid[:, t]
+            energy = np.where(v, energy, energy_before)
+            p1 = np.where(v, p1, p0)
+            step = np.where(v, step, 0.0)
+        net += step
         mw = p1
         if detail:
             paths[0][..., t], paths[1][..., t] = p1, energy
