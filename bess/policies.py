@@ -12,14 +12,21 @@
 - PerfectForesight: solves the same MILP once over the whole period on actual
   prices. Not a realisable policy — it's the ceiling to score others against.
 
+- TWAPPolicy: charge whenever the price is below the forecast's time-weighted
+  average price, discharge whenever it's above.
+
 MILPForecastPolicy and PerfectForesight plan a MW schedule and submit it as a
 setpoint bid (bess/bid.py), which is dispatched to that MW whatever the price.
+Every policy passes its bid through `bess.bid.conform`, which caps MaxAvail so
+the unit never breaches its SOC limits: the MILP's plan is only approximate
+when dispatch crosses zero within an interval, so it can't be trusted to be
+deliverable on its own.
 """
 
 import numpy as np
 import pandas as pd
 
-from bess.bid import BDUBid, curve_bid, setpoint_bid
+from bess.bid import BDUBid, conform, curve_bid, setpoint_bid
 from bess.config import Config
 from bess.data import INTERVAL
 from bess.lp import solve_schedule
@@ -87,7 +94,8 @@ class MILPForecastPolicy:
         c, d, _ = solve_schedule(
             prices, dt_hours, cfg.battery, obs.energy_mwh, cfg.terminal, cfg.mip_rel_gap, **dynamics(cfg, obs.last_mw)
         )
-        return setpoint_bid(float(d[0] - c[0]), cfg.battery, cfg.market)
+        bid = setpoint_bid(float(d[0] - c[0]), cfg.battery, cfg.market)
+        return conform(bid, obs.energy_mwh, obs.last_mw, cfg.battery)
 
 
 class MILPBidCurvePolicy:
@@ -119,7 +127,8 @@ class MILPBidCurvePolicy:
         mw = np.empty_like(sorted_mw)
         mw[self._order] = sorted_mw
         n = len(cfg.bidding.load_prices)
-        return curve_bid(cfg.bidding.load_prices, mw[:n], cfg.bidding.gen_prices, mw[n:], cfg.battery)
+        bid = curve_bid(cfg.bidding.load_prices, mw[:n], cfg.bidding.gen_prices, mw[n:], cfg.battery)
+        return conform(bid, obs.energy_mwh, obs.last_mw, cfg.battery)
 
 
 def response_curve(prices: np.ndarray, first_mw, tol_mw: float = 1e-6) -> np.ndarray:
@@ -177,4 +186,34 @@ class PerfectForesight:
 
     def decide(self, obs: Observation) -> BDUBid:
         mw = float(self.schedule[obs.tau + INTERVAL])
-        return setpoint_bid(mw, self.config.battery, self.config.market)
+        bid = setpoint_bid(mw, self.config.battery, self.config.market)
+        return conform(bid, obs.energy_mwh, obs.last_mw, self.config.battery)
+
+
+class TWAPPolicy:
+    """Threshold bidding around the forecast's time-weighted average price
+    (TWAP). Every interval, the TWAP of the blended P5MIN + predispatch
+    forecast is the threshold: each band priced below it charges at full power,
+    each band above it discharges at full power, and a band exactly at it does
+    nothing. The bands are the config's fixed daily ladder (config.bidding), so
+    the daily price lock always holds; with a price-taker, the battery charges
+    when the actual price lands at or below the highest band under the TWAP and
+    discharges when it lands at or above the lowest band over it."""
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.name = "twap"
+
+    def decide(self, obs: Observation) -> BDUBid:
+        prices, dt_hours = blended_forecast(obs)
+        twap = float(np.sum(prices * dt_hours) / np.sum(dt_hours))
+        cfg, p = self.config, self.config.battery.power_mw
+        m = cfg.market
+
+        def response(band_prices, mlf):
+            rrn = np.asarray(band_prices, float) / mlf
+            return np.where(rrn < twap, -p, np.where(rrn > twap, p, 0.0))
+
+        bid = curve_bid(cfg.bidding.load_prices, response(cfg.bidding.load_prices, m.load_mlf),
+                        cfg.bidding.gen_prices, response(cfg.bidding.gen_prices, m.gen_mlf), cfg.battery)
+        return conform(bid, obs.energy_mwh, obs.last_mw, cfg.battery)

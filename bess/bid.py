@@ -204,3 +204,54 @@ def curve_bid(
         load=SideBid(tuple(load_prices), tuple(load_bands), float(load_bands.sum()), ramp, ramp),
         gen=SideBid(tuple(gen_prices), tuple(gen_bands), float(gen_bands.sum()), ramp, ramp),
     )
+
+
+# ---- keeping a bid conforming ----
+#
+# A policy can form its bid any way it likes, then pass it through `conform`,
+# which caps each side's MaxAvail so that whatever clears is deliverable: the
+# straight-line path to the end-of-interval MW, and stopping from there at the
+# unit's ramp rate, stay inside the SOC limits. A bid that has been through it
+# never causes non-conformance.
+
+SOC_MARGIN_MWH = 1e-6  # keeps rounding from ever touching a SOC limit
+
+
+def stopping_safe_avail(budget_mwh, p_same, battery: Battery, ramp_step: float, dt_h: float):
+    """Largest end MW x on one side such that moving there from the current MW
+    and then ramping back to 0 at `ramp_step` MW per interval delivers at most
+    `budget_mwh` (at the meter) on that side. `p_same` is the current MW on the
+    same side (>= 0; 0 if the unit is on the other side, which only helps).
+
+    Ending at x then ramping down takes n = ceil(x / ramp_step) more intervals;
+    the energy is dt/2 * (p_same + 2 n x - ramp_step n (n-1)), linear in x for
+    each n, so solve each segment and keep the one that fits."""
+    n_max = int(np.ceil(battery.power_mw / ramp_step - 1e-9))
+    target = 2 * np.asarray(budget_mwh, float) / dt_h - p_same
+    x = np.zeros_like(target)
+    for n in range(1, n_max + 1):
+        lo, hi = (n - 1) * ramp_step, n * ramp_step
+        xn = (target + ramp_step * n * (n - 1)) / (2 * n)
+        x = np.where(xn >= lo, np.minimum(xn, hi), x)
+    return np.clip(x, 0.0, battery.power_mw)
+
+
+def max_avails(energy_mwh, last_mw, battery: Battery, dt_h: float):
+    """(load MaxAvail, gen MaxAvail) that keep the unit stopping-safe."""
+    ramp_step = battery.ramp_rate_mw_per_min * dt_h * 60
+    gen_budget = np.maximum(energy_mwh - battery.e_min - SOC_MARGIN_MWH, 0.0) * battery.discharge_eff
+    load_budget = np.maximum(battery.e_max - SOC_MARGIN_MWH - energy_mwh, 0.0) / battery.charge_eff
+    gen = stopping_safe_avail(gen_budget, np.maximum(last_mw, 0.0), battery, ramp_step, dt_h)
+    load = stopping_safe_avail(load_budget, np.maximum(-last_mw, 0.0), battery, ramp_step, dt_h)
+    return load, gen
+
+
+def conform(bid: BDUBid, energy_mwh: float, last_mw: float, battery: Battery) -> BDUBid:
+    """`bid` with each side's MaxAvail capped to the stopping-safe limit for
+    the current stored energy and MW. Capping MaxAvail never breaks
+    validation: it only removes effective MW."""
+    load_avail, gen_avail = max_avails(energy_mwh, last_mw, battery, 5 / 60)
+    return BDUBid(
+        load=dataclasses.replace(bid.load, max_avail=float(min(bid.load.max_avail, load_avail))),
+        gen=dataclasses.replace(bid.gen, max_avail=float(min(bid.gen.max_avail, gen_avail))),
+    )
