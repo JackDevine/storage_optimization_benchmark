@@ -2,7 +2,7 @@
 
 The MPC has risen every July (from $15,100/MWh in October 2021). Older prices
 are mapped so their cap lands on today's, changing ordinary prices as little as
-possible: the identity up to a knee k, and above it
+possible: the identity up to a knee k ($1,000, see PRICE_MAP), and above it
 
     g(p) = k + (MPC_now - k) * ((p - k) / (MPC_then - k)) ** gamma
 
@@ -50,5 +50,8 @@ def mpc_at(thresholds: pd.DataFrame, t) -> np.ndarray:
     return latest.VOLL.to_numpy()[i]
 
 
-# The mapping the benchmark's data is built with (harness/build_data.py).
-PRICE_MAP = PriceMap(mpc_now=23200.0, knee=300.0, gamma=1.0)
+# The mapping the benchmark's data is built with (harness/build_data.py). The
+# knee is $1,000: scripts/price_cap_analysis.py found that prices from $300 to
+# about $1,000 sit at the same levels whatever the cap (they're set by bids, not
+# by the cap), while the top of the tail moves with it.
+PRICE_MAP = PriceMap(mpc_now=23200.0, knee=1000.0, gamma=1.0)

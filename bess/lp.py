@@ -46,8 +46,10 @@ def solve_schedule(
     mip_rel_gap: float = 1e-4,
     p_prev: float = 0.0,
     soc_margin_mwh: float = 0.0,
+    time_limit: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (charge_mw, discharge_mw, energy_mwh) per step. `p_prev` is the
+    """Return (charge_mw, discharge_mw, energy_mwh) per step. With `time_limit`
+    (seconds), the best solution found by then is returned. `p_prev` is the
     unit's MW now (+ = discharge), where the first step's straight line starts."""
     n = len(prices)
     p, dt, b = np.asarray(prices, float), np.asarray(dt_hours, float), battery
@@ -153,10 +155,13 @@ def solve_schedule(
     h = highspy.Highs()
     h.setOptionValue("output_flag", False)
     h.setOptionValue("mip_rel_gap", mip_rel_gap)
+    if time_limit is not None:
+        h.setOptionValue("time_limit", float(time_limit))
     h.passModel(lp)
     h.run()
     status = h.getModelStatus()
-    if status != highspy.HighsModelStatus.kOptimal:
+    timed_out = status == highspy.HighsModelStatus.kTimeLimit and h.getInfo().primal_solution_status == 2
+    if status != highspy.HighsModelStatus.kOptimal and not timed_out:
         raise RuntimeError(f"MILP not optimal: {h.modelStatusToString(status)}")
 
     x = np.asarray(h.getSolution().col_value)

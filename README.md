@@ -31,7 +31,7 @@ uv run python scripts/price_cap_analysis.py # optional: the analysis behind the 
   mapped onto today's market price cap (`bess/normalise.py`), and its dev subset `data/dev.duckdb`, which is all an
   agent gets. `dispatchprice.RRP_RAW` keeps the original price.
 - **The price-cap mapping.** The cap has risen every July, from $15,100/MWh in October 2021 to $23,200. Prices up to
-  a knee ($300) are unchanged; above it, g(p) = k + (MPC_now − k)·((p − k)/(MPC_then − k))^γ, so each period's cap
+  a knee ($1,000) are unchanged; above it, g(p) = k + (MPC_now − k)·((p − k)/(MPC_then − k))^γ, so each period's cap
   lands on today's. The data is currently built with γ = 1 (a linear stretch of the tail). Actual prices use the cap in
   force when the interval started, forecasts the cap when the forecast ran. `scripts/price_cap_analysis.py`
   compares this with other maps.

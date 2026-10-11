@@ -73,7 +73,9 @@ def day_stats(args) -> list[dict]:
         if len(p) != 288:
             continue
         dt = np.full(288, 5 / 60)
-        c, d, _ = solve_schedule(p, dt, b, b.e_initial, TERMINAL, 1e-4, p_prev=0.0)
+        # A few spiky days are slow to prove optimal; a day's value within 0.1%
+        # (or after 20 s, the best found) is plenty here.
+        c, d, _ = solve_schedule(p, dt, b, b.e_initial, TERMINAL, 1e-3, p_prev=0.0, time_limit=20)
         mw = d - c
         avg = (np.concatenate([[0.0], mw[:-1]]) + mw) / 2  # straight-line average MW per interval
         rev = avg * p * dt
@@ -116,6 +118,13 @@ def compute(jobs: int) -> None:
     raw_rows = None
     for name, fn in maps().items():
         t0 = time.time()
+        part = OUT / "parts" / f"{name.replace(' ', '_').replace(',', '')}.parquet"
+        part.parent.mkdir(parents=True, exist_ok=True)
+        if part.exists():  # done on an earlier run
+            results[name] = pd.read_parquet(part)
+            if raw_rows is None:
+                raw_rows = results[name].drop(columns=[c for c in meta.columns if c not in ("region", "day")] + ["map"])
+            continue
         mapped = prices.assign(RRP=fn(prices.RRP.to_numpy(), prices.mpc.to_numpy()))
         # Only days a map changes need solving again.
         changed = (mapped.RRP != prices.RRP).groupby([prices.REGIONID, prices.day]).any()
@@ -136,6 +145,7 @@ def compute(jobs: int) -> None:
         daily = rows.merge(meta, on=["region", "day"])
         daily["map"] = name
         results[name] = daily
+        daily.to_parquet(part)
         print(f"{name}: {len(daily)} days, {time.time() - t0:.0f}s", flush=True)
     pd.concat(results.values()).to_parquet(OUT / "price_cap_daily.parquet")
 
@@ -149,7 +159,7 @@ def summarise() -> dict:
     daily = pd.read_parquet(OUT / "price_cap_daily.parquet")
     daily["fy"] = fy(daily.day)
     daily["dev"] = daily.day < DEV_END - pd.Timedelta(days=1)
-    raw = daily[daily.map == "raw"]
+    raw = daily[daily["map"] == "raw"]
     out = {"caps": raw.groupby("fy").mpc.agg(["min", "max"]).to_dict("index")}
 
     def by(df, keys):
@@ -197,7 +207,7 @@ def summarise() -> dict:
     # Each map on dev: how much it moves prices, and the statistics it produces
     # by year (a good map makes the older years look like recent ones).
     dev = daily[daily.dev]
-    base = dev[dev.map == "raw"].set_index(["region", "day"])
+    base = dev[dev["map"] == "raw"].set_index(["region", "day"])
     out["maps"] = {}
     for name, g in dev.groupby("map"):
         gi = g.set_index(["region", "day"])

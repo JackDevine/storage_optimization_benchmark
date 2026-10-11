@@ -29,6 +29,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import cma
@@ -81,10 +82,29 @@ class Prices:
         self.lane_region = np.repeat(np.arange(len(REGIONS)), len(windows))
 
     def simulate(self, params, config) -> np.ndarray:
-        """Net revenue (K, R) of per-region candidates over all the windows."""
-        lanes = [a[:, self.lane_region] for a in params]
-        net = simulate_static(self.rrp, self.minutes, *lanes, config, valid=self.valid)
+        """Net revenue (K, R) of per-region candidates over all the windows.
+        The lanes are independent, so they're split across worker processes."""
+        global _pool
+        if _pool is None:
+            _pool = ProcessPoolExecutor(WORKERS)
+        key = id(self)
+        chunks = np.array_split(np.arange(len(self.lane_region)), WORKERS)
+        if key not in _shared:
+            _shared[key] = [(self.rrp[c], self.valid[c], self.lane_region[c]) for c in chunks]
+        futures = [_pool.submit(_simulate_lanes, *lanes, self.minutes, params, config)
+                   for lanes in _shared[key]]
+        net = np.concatenate([f.result() for f in futures], axis=1)
         return net.reshape(net.shape[0], len(REGIONS), len(self.windows)).sum(-1)
+
+
+WORKERS = max(1, (os.cpu_count() or 2) - 4)
+_pool = None
+_shared: dict = {}
+
+
+def _simulate_lanes(rrp, valid, lane_region, minutes, params, config) -> np.ndarray:
+    lanes = [a[:, lane_region] for a in params]
+    return simulate_static(rrp, minutes, *lanes, config, valid=valid)
 
 
 def decode(x: np.ndarray, shape: tuple[int, int], config: Config):
@@ -176,12 +196,19 @@ def _perfect_one(args) -> float:
 
 
 def perfect(config, windows: list[Window]) -> np.ndarray:
-    """Perfect-foresight net revenue per region, summed over the windows."""
-    from concurrent.futures import ProcessPoolExecutor
-
+    """Perfect-foresight net revenue per region, summed over the windows
+    (cached per config fingerprint, which covers the data version)."""
+    cache = ROOT / "data" / "static_bid_fit" / f"perfect_{config_fingerprint(config)}.json"
+    known = json.loads(cache.read_text()) if cache.exists() else {}
     tasks = [(config, r, a, b) for r in REGIONS for a, b in windows]
-    with ProcessPoolExecutor(max(1, os.cpu_count() - 2)) as pool:
-        nets = list(pool.map(_perfect_one, tasks))
+    todo = [t for t in tasks if f"{t[1]} {t[2]} {t[3]}" not in known]
+    if todo:
+        with ProcessPoolExecutor(max(1, os.cpu_count() - 2)) as pool:
+            for t, net in zip(todo, pool.map(_perfect_one, todo)):
+                known[f"{t[1]} {t[2]} {t[3]}"] = net
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(known))
+    nets = [known[f"{t[1]} {t[2]} {t[3]}"] for t in tasks]
     return np.asarray(nets).reshape(len(REGIONS), len(windows)).sum(-1)
 
 

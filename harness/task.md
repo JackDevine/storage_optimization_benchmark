@@ -106,7 +106,7 @@ occasional gaps, so the latest run can be stale: e.g. there are no P5MIN runs fr
   the forecast runs for one window, which is much faster.
 - **Prices are mapped onto today's cap.** The market price cap has risen every July, from $15,100/MWh in 2021 to
   $23,200 now. Every price in the data (actual and forecast, dev and holdout) from a period with a lower cap has
-  been mapped onto $23,200: prices up to $300/MWh are unchanged, and above that they're stretched linearly so the
+  been mapped onto $23,200: prices up to $1,000/MWh are unchanged, and above that they're stretched linearly so the
   period's cap lands on $23,200 (`bess.normalise`). `dispatchprice.RRP_RAW` is the original price.
 - Two periods are excluded from scoring and from the episodes: the June 2022 market suspension (trading days 12–23
   June 2022), and October 2022, for which AEMO's archive has no predispatch runs (`predispatchprice` has none then).
