@@ -5,11 +5,23 @@
 
 import json
 import math
+import sys
 from html import escape
 from pathlib import Path
 
+import duckdb
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from bess.normalise import PRICE_MAP, mpc_at  # noqa: E402
+from harness.splits import DEV_END, EXCLUDED, REGIONS  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "data" / "analysis"
+RAW_DB = ROOT / "data" / "benchmark.duckdb"
+CHOSEN = "knee 1000, gamma 1"  # the map the data is built with (bess.normalise.PRICE_MAP)
 
 MAPS = [  # (name in the summary, label, series colour token)
     ("raw", "Raw prices", "--s1"),
@@ -81,6 +93,130 @@ def arbitrage_chart(maps: dict) -> str:
     return "".join(out)
 
 
+def scatter_data() -> dict:
+    """Per region-day: arbitrage value (from the analysis, raw and under the
+    chosen map) against the mean price, the $300 cap payout and the payout
+    above $1,000, each from the same prices. Compact arrays for the page."""
+    con = duckdb.connect(str(RAW_DB), read_only=True)
+    try:
+        prices = con.execute("""SELECT SETTLEMENTDATE, REGIONID, RRP FROM dispatchprice
+                                WHERE INTERVENTION = 0 ORDER BY REGIONID, SETTLEMENTDATE""").df()
+        thresholds = con.execute("SELECT * FROM market_price_thresholds").df()
+    finally:
+        con.close()
+    start = prices.SETTLEMENTDATE - pd.Timedelta(minutes=5)
+    prices["day"] = (start - pd.Timedelta(hours=4)).dt.normalize()
+    for x0, x1 in EXCLUDED[:1]:  # the analysis left out only the suspension
+        prices = prices[~((prices.SETTLEMENTDATE > x0) & (prices.SETTLEMENTDATE <= x1))]
+    prices = prices[prices.day >= pd.Timestamp("2021-10-01")]
+    mapped = PRICE_MAP(prices.RRP.to_numpy(), mpc_at(thresholds, prices.SETTLEMENTDATE - pd.Timedelta(minutes=5)))
+    daily = pd.read_parquet(OUT / "price_cap_daily.parquet", columns=["region", "day", "arbitrage", "n", "map"])
+    out = {"regions": REGIONS, "dev_end": str(DEV_END.date())}
+    for key, name, p in [("raw", "raw", prices.RRP.to_numpy()), ("mapped", CHOSEN, mapped)]:
+        f = pd.DataFrame({"region": prices.REGIONID.to_numpy(), "day": prices.day.to_numpy(), "p": p})
+        g = f.groupby(["region", "day"]).p
+        stats = pd.DataFrame({
+            "swap": g.mean(),
+            "cap300": g.apply(lambda v: np.maximum(v - 300, 0).mean()),
+            "cap1000": g.apply(lambda v: np.maximum(v - 1000, 0).mean()),
+        }).reset_index()
+        d = daily[(daily["map"] == name) & (daily.n == 288)].merge(stats, on=["region", "day"])
+        d = d.sort_values(["day", "region"])
+        fy = d.day.dt.year + (d.day.dt.month >= 7)
+        out[key] = {
+            "arb": d.arbitrage.round(1).tolist(), "swap": d.swap.round(2).tolist(),
+            "cap300": d.cap300.round(3).tolist(), "cap1000": d.cap1000.round(3).tolist(),
+            "fy": fy.astype(int).tolist(), "region": d.region.map(REGIONS.index).tolist(),
+            "day": d.day.dt.strftime("%Y-%m-%d").tolist(),
+        }
+    return out
+
+
+# The scatter's drawing code (canvas, hover, filters), outside the f-string so
+# its braces stay single.
+SCATTER_JS = r"""<script>
+const SC = __SCATTER__;
+(function () {
+  const ySel = document.getElementById("sc-y"), yearSel = document.getElementById("sc-year");
+  const years = [...new Set(SC.raw.fy)].sort();
+  const fyLabel = y => `${y - 1}–${String(y).slice(2)}` + (y >= 2026 ? " (holdout)" : "");
+  yearSel.innerHTML = `<option value="all">All years</option>` + years.map(y => `<option value="${y}">${fyLabel(y)}</option>`).join("");
+  const sym = (v, c) => Math.sign(v) * Math.log10(1 + Math.abs(v) / c);
+  const C = { arb: 10, swap: 10, cap300: 0.1, cap1000: 0.1 };
+  const color = i => getComputedStyle(document.documentElement).getPropertyValue(`--k${i + 1}`).trim();
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const panels = { raw: document.getElementById("sc-raw"), mapped: document.getElementById("sc-mapped") };
+  let drawn = {};
+  function niceTicks(lo, hi, c) {
+    const out = [0];
+    for (const s of [1, -1]) for (let e = -2; e <= 6; e++) for (const m of [1, 10]) {
+      const v = s * m * 10 ** e; if (m === 10) continue;
+      const t = sym(v, c); if (t > lo && t < hi && Math.abs(v) >= c) out.push(v);
+    }
+    return [...new Set(out)].filter(v => sym(v, c) >= lo && sym(v, c) <= hi);
+  }
+  const fmt = v => { const a = Math.abs(v); return (v < 0 ? "−" : "") + "$" + (a >= 1000 ? (a / 1000) + "k" : a >= 1 ? a.toFixed(0) : a.toString()); };
+  function draw() {
+    const yk = ySel.value, yr = yearSel.value;
+    const sel = d => d.fy.map((f, i) => (yr === "all" || f === +yr) ? i : -1).filter(i => i >= 0);
+    const idx = { raw: sel(SC.raw), mapped: sel(SC.mapped) };
+    let xs = [], ys = [];
+    for (const k of ["raw", "mapped"]) for (const i of idx[k]) { xs.push(sym(SC[k].arb[i], C.arb)); ys.push(sym(SC[k][yk][i], C[yk])); }
+    const pad = (a, b) => [a - (b - a) * 0.04, b + (b - a) * 0.04];
+    const [x0, x1] = pad(Math.min(...xs), Math.max(...xs)), [y0, y1] = pad(Math.min(...ys, 0), Math.max(...ys));
+    const byYear = yr === "all";
+    const groups = byYear ? years : SC.regions.map((_, i) => i);
+    document.getElementById("sc-legend").innerHTML = '<ul class="legend">' + groups.map((g, i) =>
+      `<li><span class="swatch" style="background:var(--k${i + 1})"></span>${byYear ? fyLabel(g) : SC.regions[g]}</li>`).join("") + "</ul>";
+    document.getElementById("sc-note").textContent = `${idx.raw.length.toLocaleString()} region-days. Colour: ${byYear ? "financial year" : "region"}. Hover a point for its values.`;
+    for (const k of ["raw", "mapped"]) {
+      const cv = panels[k], dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+      cv.width = W * dpr; cv.height = H * dpr;
+      const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+      const L = 52, R = 10, T = 10, B = 34;
+      const X = v => L + (sym(v, C.arb) - x0) / (x1 - x0) * (W - L - R), Y = v => T + (y1 - sym(v, C[yk])) / (y1 - y0) * (H - T - B);
+      g.font = "11px " + css("--mono"); g.fillStyle = css("--muted"); g.strokeStyle = css("--rule"); g.lineWidth = 1;
+      for (const v of niceTicks(x0, x1, C.arb)) { const x = X(v); g.beginPath(); g.moveTo(x, T); g.lineTo(x, H - B); g.stroke(); g.textAlign = "center"; g.fillText(fmt(v), x, H - B + 14); }
+      for (const v of niceTicks(y0, y1, C[yk])) { const y = Y(v); g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke(); g.textAlign = "right"; g.fillText(fmt(v), L - 6, y + 4); }
+      g.textAlign = "center"; g.fillText("arbitrage value, $/day", L + (W - L - R) / 2, H - 4);
+      const d = SC[k], pts = [];
+      g.globalAlpha = byYear ? 0.45 : 0.6;
+      for (const i of idx[k]) {
+        const gi = byYear ? years.indexOf(d.fy[i]) : d.region[i];
+        const x = X(d.arb[i]), y = Y(d[yk][i]);
+        g.fillStyle = color(gi); g.beginPath(); g.arc(x, y, 2.2, 0, 2 * Math.PI); g.fill();
+        pts.push([x, y, i]);
+      }
+      g.globalAlpha = 1;
+      drawn[k] = { pts, yk };
+    }
+  }
+  function hover(k, ev) {
+    const cv = panels[k], tip = cv.parentElement.querySelector(".tip") || cv.parentElement.appendChild(Object.assign(document.createElement("div"), { className: "tip" }));
+    const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
+    let best = null, bd = 64;
+    for (const [x, y, i] of drawn[k].pts) { const dd = (x - mx) ** 2 + (y - my) ** 2; if (dd < bd) { bd = dd; best = [x, y, i]; } }
+    if (!best) { tip.hidden = true; return; }
+    const d = SC[k], i = best[2], yk = drawn[k].yk;
+    const names = { swap: "mean price", cap300: "payout above $300", cap1000: "payout above $1,000" };
+    tip.innerHTML = `${SC.regions[d.region[i]]} ${d.day[i]}<br>arbitrage $${d.arb[i].toLocaleString()}/day<br>${names[yk]} $${d[yk][i].toLocaleString()}/MWh`;
+    tip.hidden = false;
+    tip.style.left = Math.min(best[0] + 10, cv.clientWidth - 190) + "px"; tip.style.top = (best[1] + 34) + "px";
+  }
+  for (const k of ["raw", "mapped"]) {
+    panels[k].addEventListener("mousemove", e => hover(k, e));
+    panels[k].addEventListener("mouseleave", () => { const t = panels[k].parentElement.querySelector(".tip"); if (t) t.hidden = true; });
+  }
+  ySel.addEventListener("change", draw); yearSel.addEventListener("change", draw);
+  window.addEventListener("resize", draw);
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
+  new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  draw();
+})();
+</script>
+"""
+
+
 def legend(items) -> str:
     return '<ul class="legend">' + "".join(
         f'<li><span class="swatch" style="background:var({c})"></span>{escape(lab)}</li>' for lab, c in items) + "</ul>"
@@ -115,16 +251,19 @@ def main() -> None:
   --bg: #f6f7f5; --panel: #ffffff; --ink: #1b2422; --muted: #5b6764; --rule: #d9dedb;
   --accent: #0f6e63; --cap: #b4561f;
   --s1: #8a9491; --s2: #b4561f; --s3: #c99a2e; --s4: #0f6e63;
+  --k1: #2a6fb0; --k2: #c2410c; --k3: #0f8a6e; --k4: #9d3ea8; --k5: #a37a00; --k6: #5b6764;
   --display: "IBM Plex Sans Condensed", "Arial Narrow", sans-serif;
   --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, monospace;
 }}
 @media (prefers-color-scheme: dark) {{ :root:not([data-theme="light"]) {{
   --bg: #121816; --panel: #1a2220; --ink: #e5ebe8; --muted: #9aa7a3; --rule: #2e3a37;
-  --accent: #4fc1b0; --cap: #e88a52; --s1: #7d8a86; --s2: #e88a52; --s3: #e0b85a; --s4: #4fc1b0; color-scheme: dark }} }}
+  --accent: #4fc1b0; --cap: #e88a52; --s1: #7d8a86; --s2: #e88a52; --s3: #e0b85a; --s4: #4fc1b0;
+  --k1: #6fa8e0; --k2: #f08a50; --k3: #47c4a2; --k4: #d07fdb; --k5: #e0bb45; --k6: #a3b0ac; color-scheme: dark }} }}
 :root[data-theme="dark"] {{
   --bg: #121816; --panel: #1a2220; --ink: #e5ebe8; --muted: #9aa7a3; --rule: #2e3a37;
-  --accent: #4fc1b0; --cap: #e88a52; --s1: #7d8a86; --s2: #e88a52; --s3: #e0b85a; --s4: #4fc1b0; color-scheme: dark }}
+  --accent: #4fc1b0; --cap: #e88a52; --s1: #7d8a86; --s2: #e88a52; --s3: #e0b85a; --s4: #4fc1b0;
+  --k1: #6fa8e0; --k2: #f08a50; --k3: #47c4a2; --k4: #d07fdb; --k5: #e0bb45; --k6: #a3b0ac; color-scheme: dark }}
 body {{ background: var(--bg); color: var(--ink); font: 15px/1.6 var(--body); }}
 main {{ max-width: 46rem; margin: 0 auto; padding-inline: 16px; padding-block: 40px 64px; }}
 h1, h2 {{ font-family: var(--display); font-weight: 600; text-wrap: balance; line-height: 1.15; }}
@@ -150,6 +289,18 @@ th, td {{ padding: 6px 10px; border-bottom: 1px solid var(--rule); text-align: l
 th {{ font: 500 .72rem var(--mono); text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }}
 td.num, th.num {{ text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }}
 code {{ font-family: var(--mono); font-size: .9em; }}
+.controls {{ display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center; margin: .8rem 0; font-size: .88rem; }}
+.controls label {{ display: flex; gap: 8px; align-items: center; }}
+select {{ font: inherit; padding: 4px 8px; border: 1px solid var(--rule); border-radius: 4px; background: var(--panel); color: var(--ink); }}
+select:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 1px; }}
+.panels {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 14px; }}
+.panel {{ position: relative; min-width: 0; }}
+.panel h3 {{ font: 600 .95rem var(--display); margin: 0 0 4px; }}
+.panel canvas {{ width: 100%; aspect-ratio: 1 / 0.85; max-width: 100%; display: block; background: var(--panel);
+  border: 1px solid var(--rule); border-radius: 4px; }}
+.tip {{ position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--rule); border-radius: 4px;
+  padding: 6px 8px; font: 12px/1.4 var(--mono); box-shadow: 0 2px 8px rgb(0 0 0 / .15); white-space: nowrap; z-index: 2; }}
+.c1 {{ --c: var(--k1); }}
 </style>
 <main>
 <div class="eyebrow">Storage optimisation benchmark · data preparation</div>
@@ -185,6 +336,26 @@ the cap raises it; the question is how much of that is the cap and how much is i
 just above the knee come out <i>lower</i> than they were; that's why those rows change value least, and why they're
 not candidates.</p>
 
+<h2>Day by day: arbitrage against what the day's prices pay</h2>
+<p>Each point is one region-day: the battery's perfect-foresight arbitrage value (x) against a measure of that
+day's prices (y), on the raw prices and on the mapped ones. A good map moves older days toward the recent pattern
+without bending the relationship. Below $1,000 the chosen map changes nothing, so the payout above $1,000 is the
+measure that shows the stretch most directly; the mean price and the $300 payout mix stretched and unchanged
+prices. Both axes are symmetric-log. 2025–26 and 2026–27 are holdout years, shown for context.</p>
+<div class="controls">
+  <label for="sc-y">Y axis <select id="sc-y">
+    <option value="cap1000">Payout above $1,000/MWh ($/MWh, daily mean)</option>
+    <option value="cap300">Payout above $300/MWh ($/MWh, daily mean)</option>
+    <option value="swap">Mean price ($/MWh)</option></select></label>
+  <label for="sc-year">Year <select id="sc-year"></select></label>
+</div>
+<div id="sc-legend"></div>
+<div class="panels">
+  <div class="panel"><h3>Raw prices</h3><canvas id="sc-raw" aria-label="Scatter of daily arbitrage against the chosen price measure, raw prices"></canvas></div>
+  <div class="panel"><h3>Mapped onto $23,200 (knee $1,000)</h3><canvas id="sc-mapped" aria-label="The same scatter on mapped prices"></canvas></div>
+</div>
+<p class="note" id="sc-note" style="color:var(--muted);font-size:.85rem"></p>
+
 <h2>Year by year, raw prices</h2>
 <div class="table-wrap"><table>
 <thead><tr><th>Year</th><th class="num">Cap</th><th class="num">Region-days</th><th class="num">Arbitrage /day</th>
@@ -203,6 +374,7 @@ about 23 to 15 as the market changes; no map fixes that, since it isn't about th
 market floor (−$1,000) hasn't changed, so negative prices are never mapped.</p>
 </main>
 """
+    html += SCATTER_JS.replace("__SCATTER__", json.dumps(scatter_data(), separators=(",", ":")))
     (OUT / "price_cap_report.html").write_text(html)
     print(OUT / "price_cap_report.html")
 
