@@ -130,7 +130,7 @@ def evaluate(
                 return {**meta, "error": (stderr or stdout)[-2000:]}
         return {**meta, "error": f"the scoring process exited with code {proc.returncode} and no output, twice"}
 
-    workers = max_workers or min(len(jobs), max(1, (os.cpu_count() or 2) - 2))
+    workers = max_workers or min(len(jobs), max(1, (os.cpu_count() or 2) - 2), _memory_workers())
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(run, jobs))
     return {
@@ -139,6 +139,19 @@ def evaluate(
         "windows": [[str(a), str(b)] for a, b in windows],
         "eval_seconds": time.time() - t0,
     }
+
+
+JOB_MEMORY_GB = 1.2  # a scoring job and its policy process, allowing for a torch policy (about 0.5 GB alone)
+
+
+def _memory_workers() -> int:
+    """How many scoring jobs fit in the memory available now, keeping 2 GB spare."""
+    try:
+        with open("/proc/meminfo") as f:
+            avail_kb = next(int(line.split()[1]) for line in f if line.startswith("MemAvailable:"))
+    except (OSError, StopIteration):
+        return 1_000
+    return max(2, int((avail_kb / 1e6 - 2) / JOB_MEMORY_GB))
 
 
 def aggregate(jobs: list[dict]) -> dict:
