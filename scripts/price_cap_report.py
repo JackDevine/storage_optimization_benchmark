@@ -333,6 +333,61 @@ const SC = __SCATTER__;
 """
 
 
+# The covariance / correlation tables (added from the published page by another session).
+COVARIANCE_JS = r"""
+<script>
+(function () {
+  const VARS = [["swap", "mean_price"], ["cap300", "cap_payout"], ["cap1000", "value_above_1000"], ["arb", "arbitrage_payout"]];
+  const MAPS = [["raw", "Raw prices"], ["mapped", "$1,000 knee mapped"], ["scaled", "Constant scaling ($0 knee)"]];
+  const yearSel = document.getElementById("sc-year"), regionSel = document.getElementById("sc-region"), mode = document.getElementById("cv-mode"), per = document.getElementById("cv-period");
+  const devEnd = new Date(SC.dev_end), isDev = i => new Date(SC.raw.day[i].replace("week of ", "")) < devEnd;
+  const sig = v => { if (v === 0) return "0"; const a = Math.abs(v);
+    return a >= 1000 ? Math.round(v).toLocaleString() : v.toPrecision(3).replace(/\.?0+$/, m => m.includes(".") ? "" : m); };
+  function stats(d, idx) {
+    const n = idx.length, cols = VARS.map(([k]) => idx.map(i => d[k][i]));
+    const mu = cols.map(c => c.reduce((a, b) => a + b, 0) / n);
+    const cov = cols.map((a, p) => cols.map((b, q) => a.reduce((s, x, j) => s + (x - mu[p]) * (b[j] - mu[q]), 0) / (n - 1)));
+    const corr = cov.map((r, p) => r.map((v, q) => v / Math.sqrt(cov[p][p] * cov[q][q])));
+    return { n, cov, corr };
+  }
+  function draw() {
+    const yr = yearSel.value, rg = regionSel.value, m = mode.value;
+    const idx = SC.raw.fy.map((f, i) => ((yr === "all" || f === +yr) && (rg === "all" || SC.raw.region[i] === +rg) && (per.value === "all" || isDev(i))) ? i : -1).filter(i => i >= 0);
+    if (idx.length < 3) { document.getElementById("cv-tables").innerHTML = "<p>Too few region-weeks for this selection.</p>"; return; }
+    const head = `<tr><th></th>${VARS.map(([, n]) => `<th class="num"><code>${n}</code></th>`).join("")}</tr>`;
+    document.getElementById("cv-tables").innerHTML = MAPS.map(([k, lab]) => {
+      const s = stats(SC[k], idx), M = s[m];
+      const body = VARS.map(([, n], p) => `<tr><th><code>${n}</code></th>${M[p].map((v, q) =>
+        `<td class="num${p === q ? " diag" : ""}">${isFinite(v) ? (m === "corr" ? v.toFixed(2) : sig(v)) : "–"}</td>`).join("")}</tr>`).join("");
+      return `<div class="cv-block"><h4>${lab}</h4><div class="table-wrap"><table><thead>${head}</thead><tbody>${body}</tbody></table></div></div>`;
+    }).join("");
+    document.getElementById("cv-note").textContent = `${idx.length.toLocaleString()} region-weeks per map. Units: prices and payouts in $/MWh (weekly means), arbitrage in $/day; covariances are in the product of the two units. A dash means a measure is zero throughout the selection.`;
+  }
+  const pairSel = document.getElementById("cy-pair"), PAIRS = [];
+  for (let p = 0; p < 4; p++) for (let q = p + 1; q < 4; q++) PAIRS.push([p, q]);
+  PAIRS.sort((a, b) => (b[1] === 3) - (a[1] === 3));
+  pairSel.innerHTML = PAIRS.map(([p, q], j) => `<option value="${j}">${VARS[p][1]} × ${VARS[q][1]}</option>`).join("");
+  pairSel.value = String(PAIRS.findIndex(([p, q]) => p === 2 && q === 3));
+  function drawYears() {
+    const [p, q] = PAIRS[+pairSel.value], rg = regionSel.value;
+    const yrs = [...new Set(SC.raw.fy)].sort();
+    const lab = y => `${y - 1}–${String(y).slice(2)}` + (y >= 2026 ? (per.value === "dev" ? " (Jul–Aug 2025 only)" : " (holdout)") : "");
+    const rows = yrs.map(y => {
+      const idx = SC.raw.fy.map((f, i) => (f === y && (rg === "all" || SC.raw.region[i] === +rg) && (per.value === "all" || isDev(i))) ? i : -1).filter(i => i >= 0);
+      if (idx.length < 3) return "";
+      const cells = MAPS.map(([k]) => { const v = stats(SC[k], idx).corr[p][q]; return `<td class="num">${isFinite(v) ? v.toFixed(2) : "–"}</td>`; }).join("");
+      return `<tr><td>${lab(y)}</td><td class="num">${idx.length}</td>${cells}</tr>`;
+    }).join("");
+    document.getElementById("cy-table").innerHTML = `<thead><tr><th>Year</th><th class="num">Region-weeks</th>${MAPS.map(([, l]) => `<th class="num">${l}</th>`).join("")}</tr></thead><tbody>${rows}</tbody>`;
+  }
+  for (const el of [yearSel, regionSel, mode, per]) el.addEventListener("change", draw);
+  for (const el of [regionSel, per, pairSel]) el.addEventListener("change", drawYears);
+  draw(); drawYears();
+})();
+</script>
+"""
+
+
 def legend(items) -> str:
     return '<ul class="legend">' + "".join(
         f'<li><span class="swatch" style="background:var({c})"></span>{escape(lab)}</li>' for lab, c in items) + "</ul>"
@@ -432,6 +487,10 @@ table.cm th {{ font-size: .68rem; letter-spacing: 0; text-transform: none; }}
 table.cm td.self {{ color: var(--muted); }}
 .combined canvas {{ aspect-ratio: 1 / 0.62; }}
 .links {{ display: inline-flex; gap: 6px; align-items: center; font-size: .85rem; color: var(--muted); margin: 2px 0 6px; }}
+.cv-block {{ margin: .9rem 0 1.2rem; }}
+.cv-block h4 {{ font: 600 .9rem var(--display); margin: 0 0 4px; }}
+.cv-block th code {{ text-transform: none; letter-spacing: 0; }}
+.cv-block td.diag {{ font-weight: 500; color: var(--accent); }}
 .marker {{ display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: -1px; }}
 </style>
 <main>
@@ -500,6 +559,22 @@ prices. Both axes are symmetric-log. 2025–26 and 2026–27 are holdout years, 
 </div>
 <p class="note" id="sc-note" style="color:var(--muted);font-size:.85rem"></p>
 
+<h3 style="font:600 1.05rem var(--display);margin:1.8rem 0 .3rem">Covariance of the four weekly measures</h3>
+<p>Sample covariance across region-weeks of the mean price, the payout above $300 (cap payout), the payout above $1,000
+and the arbitrage value, on each set of prices. The Year and Region selectors above filter these too; by default only dev-period weeks are used, since 2025–26 and
+2026–27 are holdout. Diagonal entries
+are variances. Switch to correlation to compare across maps without the scale effect.</p>
+<div class="controls"><label for="cv-mode">Show <select id="cv-mode">
+  <option value="cov">Covariance</option><option value="corr">Correlation</option></select></label>
+  <label for="cv-period">Period <select id="cv-period">
+  <option value="dev">Dev weeks only (to Aug 2025)</option><option value="all">All weeks, incl. holdout</option></select></label></div>
+<div id="cv-tables"></div>
+<p class="note" id="cv-note" style="color:var(--muted);font-size:.85rem"></p>
+<h4 style="font:600 .9rem var(--display);margin:1.2rem 0 4px">Correlation year by year</h4>
+<p>One pair at a time, each financial year computed separately (Region and Period selectors apply; Year is ignored here).</p>
+<div class="controls"><label for="cy-pair">Pair <select id="cy-pair"></select></label></div>
+<div class="table-wrap"><table id="cy-table"></table></div>
+
 <h2>Do the relationships hold year to year?</h2>
 <p>Correlations between the four weekly measures (one value per region-week, as in the scatter above), computed
 separately on each price set, so each map's own arbitrage values are correlated with its own price measures. One
@@ -533,6 +608,7 @@ market floor (−$1,000) hasn't changed, so negative prices are never mapped.</p
 </main>
 """
     html += SCATTER_JS.replace("__SCATTER__", json.dumps(scatter_data(), separators=(",", ":")))
+    html += COVARIANCE_JS
     (OUT / "price_cap_report.html").write_text(html)
     print(OUT / "price_cap_report.html")
 
