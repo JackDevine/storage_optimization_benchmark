@@ -146,6 +146,8 @@ SCATTER_JS = r"""<script>
 const SC = __SCATTER__;
 (function () {
   const ySel = document.getElementById("sc-y"), yearSel = document.getElementById("sc-year");
+  const regionSel = document.getElementById("sc-region");
+  regionSel.innerHTML = `<option value="all">All regions</option>` + SC.regions.map((r, i) => `<option value="${i}">${r}</option>`).join("");
   const years = [...new Set(SC.raw.fy)].sort();
   const fyLabel = y => `${y - 1}–${String(y).slice(2)}` + (y >= 2026 ? " (holdout)" : "");
   yearSel.innerHTML = `<option value="all">All years</option>` + years.map(y => `<option value="${y}">${fyLabel(y)}</option>`).join("");
@@ -166,14 +168,15 @@ const SC = __SCATTER__;
   }
   const fmt = v => { const a = Math.abs(v); return (v < 0 ? "−" : "") + "$" + (a >= 1000 ? (a / 1000) + "k" : a >= 1 ? a.toFixed(0) : a.toString()); };
   function draw() {
-    const yk = ySel.value, yr = yearSel.value;
-    const sel = d => d.fy.map((f, i) => (yr === "all" || f === +yr) ? i : -1).filter(i => i >= 0);
+    const yk = ySel.value, yr = yearSel.value, rg = regionSel.value;
+    const sel = d => d.fy.map((f, i) => ((yr === "all" || f === +yr) && (rg === "all" || d.region[i] === +rg)) ? i : -1)
+      .filter(i => i >= 0);
     const idx = Object.fromEntries(KEYS.map(k => [k, sel(SC[k])]));
     let xs = [], ys = [];
     for (const k of KEYS) for (const i of idx[k]) { xs.push(sym(SC[k].arb[i], C.arb)); ys.push(sym(SC[k][yk][i], C[yk])); }
     const pad = (a, b) => [a - (b - a) * 0.04, b + (b - a) * 0.04];
     const [x0, x1] = pad(Math.min(...xs), Math.max(...xs)), [y0, y1] = pad(Math.min(...ys, 0), Math.max(...ys));
-    const byYear = yr === "all";
+    const byYear = yr === "all" || rg !== "all";  // one region: colour by year
     const groups = byYear ? years : SC.regions.map((_, i) => i);
     document.getElementById("sc-legend").innerHTML = '<ul class="legend">' + groups.map((g, i) =>
       `<li><span class="swatch" style="background:var(--k${i + 1})"></span>${byYear ? fyLabel(g) : SC.regions[g]}</li>`).join("") + "</ul>";
@@ -217,6 +220,7 @@ const SC = __SCATTER__;
     panels[k].addEventListener("mouseleave", () => { const t = panels[k].parentElement.querySelector(".tip"); if (t) t.hidden = true; });
   }
   ySel.addEventListener("change", draw); yearSel.addEventListener("change", draw);
+  regionSel.addEventListener("change", draw);
   window.addEventListener("resize", draw);
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
   new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
@@ -359,6 +363,7 @@ prices. Both axes are symmetric-log. 2025–26 and 2026–27 are holdout years, 
     <option value="cap300">Payout above $300/MWh ($/MWh, monthly mean)</option>
     <option value="swap">Mean price ($/MWh)</option></select></label>
   <label for="sc-year">Year <select id="sc-year"></select></label>
+  <label for="sc-region">Region <select id="sc-region"></select></label>
 </div>
 <div id="sc-legend"></div>
 <div class="panels">
