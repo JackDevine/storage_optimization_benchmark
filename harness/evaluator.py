@@ -22,6 +22,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -31,7 +32,7 @@ import pandas as pd
 from bess.config import Config, load_config
 from bess.data import DB_PATH, load_region
 from bess.policies import PerfectForesight
-from bess.remote import RemotePolicy, config_from_dict, config_to_dict
+from bess.remote import RemotePolicy, RemotePolicyError, config_from_dict, config_to_dict
 from bess.sim import simulate, summarise
 from harness.sandbox import PROJECT_ROOT, policy_sandbox
 from harness.splits import DATA_VERSION, DEV_EPISODES, DEV_MONTHS, HOLDOUT_EPISODES, HOLDOUT_MONTHS, REGIONS, Window
@@ -125,12 +126,17 @@ def evaluate(
                 proc.communicate()
                 return {**meta, "error": f"timed out after {timeout_s:.0f}s"}
             if proc.returncode == 0:
-                return {**json.loads(stdout.strip().splitlines()[-1]), **meta}
+                result = json.loads(stdout.strip().splitlines()[-1])
+                if result.get("killed") and attempt == 0:
+                    continue  # the policy process was killed from outside (e.g. out of memory): run it again
+                return {**result, **meta}
             if (stderr or stdout).strip():
                 return {**meta, "error": (stderr or stdout)[-2000:]}
         return {**meta, "error": f"the scoring process exited with code {proc.returncode} and no output, twice"}
 
-    workers = max_workers or min(len(jobs), max(1, (os.cpu_count() or 2) - 2), _memory_workers())
+    # An explicit max_workers is capped by memory too: an agent's own script
+    # asking for more jobs than fit would push the machine into swap.
+    workers = min(max_workers or max(1, (os.cpu_count() or 2) - 2), len(jobs), _memory_workers(job_memory_gb(policy_dir)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(run, jobs))
     return {
@@ -141,17 +147,22 @@ def evaluate(
     }
 
 
-JOB_MEMORY_GB = 1.2  # a scoring job and its policy process, allowing for a torch policy (about 0.5 GB alone)
+JOB_MEMORY_GB = 0.6  # a scoring job (about 0.3 GB) and a Python policy process (about 0.2 GB)
 
 
-def _memory_workers() -> int:
+def job_memory_gb(policy_dir: Path) -> float:
+    """Memory to budget for one scoring job of this policy."""
+    return JOB_MEMORY_GB
+
+
+def _memory_workers(per_job_gb: float = JOB_MEMORY_GB) -> int:
     """How many scoring jobs fit in the memory available now, keeping 2 GB spare."""
     try:
         with open("/proc/meminfo") as f:
             avail_kb = next(int(line.split()[1]) for line in f if line.startswith("MemAvailable:"))
     except (OSError, StopIteration):
         return 1_000
-    return max(2, int((avail_kb / 1e6 - 2) / JOB_MEMORY_GB))
+    return max(2, int((avail_kb / 1e6 - 2) / per_job_gb))
 
 
 def aggregate(jobs: list[dict]) -> dict:
@@ -195,19 +206,37 @@ def _run_region(args) -> dict:
     policy_dir = Path(args.policy_dir)
     out_dir = Path(args.out_dir) if args.out_dir else None
     tag = args.tag or args.region
-    stderr = open(out_dir / f"{tag}_stderr.log", "w") if out_dir else subprocess.DEVNULL
+    # The policy's stderr goes to a file even without out_dir, to tell a policy
+    # that crashed (it says why) from one killed from outside (it says nothing).
+    stderr = open(out_dir / f"{tag}_stderr.log", "w+") if out_dir else tempfile.TemporaryFile("w+")
 
+    def silent() -> bool:
+        stderr.flush()
+        stderr.seek(0)
+        return not stderr.read().strip()
+
+    killed = {"region": args.region, "killed": True,
+              "error": "the policy process was killed from outside (no error output)"}
     t0 = time.time()
-    policy = RemotePolicy(
-        policy_dir / "policy.py", config, args.region,
-        wrapper=None if args.no_sandbox else policy_sandbox(policy_dir),
-        cwd=policy_dir, stderr=stderr,
-    )
+    try:
+        policy = RemotePolicy(
+            policy_dir / "policy.py", config, args.region,
+            wrapper=None if args.no_sandbox else policy_sandbox(policy_dir),
+            cwd=policy_dir, stderr=stderr,
+        )
+    except RemotePolicyError:
+        if silent():
+            return killed
+        raise
     try:
         intervals = simulate(policy, data, config, start, end)
     finally:
         policy.close()
     policy_seconds = time.time() - t0
+    if policy.exited and silent():
+        # The policy process went away without a word: killed from outside
+        # (a crash leaves a traceback). Not the policy's fault, so say so.
+        return killed
     summary = summarise(intervals, config.battery)
     perfect = summarise(
         simulate(PerfectForesight(config, data.actual_rrp, start, end), data, config, start, end),

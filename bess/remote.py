@@ -93,6 +93,7 @@ class RemotePolicy:
             bufsize=1,
             cwd=cwd,
         )
+        self.exited = False  # the policy process went away mid-protocol
         self._p5_run = self._pd_run = None
         self._history_sent = 0
         self._call({"init": {"region": region, "config": config_to_dict(config)}})
@@ -105,6 +106,7 @@ class RemotePolicy:
         except BrokenPipeError:
             line = ""
         if not line:
+            self.exited = True
             raise RemotePolicyError(f"policy process exited (code {self._proc.poll()})")
         reply = json.loads(line)
         if "error" in reply:
