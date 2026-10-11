@@ -12,8 +12,9 @@
 - PerfectForesight: solves the same MILP once over the whole period on actual
   prices. Not a realisable policy — it's the ceiling to score others against.
 
-- TWAPPolicy: charge whenever the price is below the forecast's time-weighted
-  average price, discharge whenever it's above.
+- TWAPPolicy: charge when the price is below the forecast's time-weighted
+  average price (the value of stored energy) by more than losses and wear,
+  discharge when it's above it by more.
 
 MILPForecastPolicy and PerfectForesight plan a MW schedule and submit it as a
 setpoint bid (bess/bid.py), which is dispatched to that MW whatever the price.
@@ -26,7 +27,7 @@ deliverable on its own.
 import numpy as np
 import pandas as pd
 
-from bess.bid import BDUBid, conform, curve_bid, setpoint_bid
+from bess.bid import N_BANDS, BDUBid, SideBid, conform, curve_bid, setpoint_bid
 from bess.config import Config
 from bess.data import INTERVAL
 from bess.lp import solve_schedule
@@ -190,30 +191,82 @@ class PerfectForesight:
         return conform(bid, obs.energy_mwh, obs.last_mw, self.config.battery)
 
 
+# TWAPPolicy's deadband scale, calibrated so the policy averages one cycle a day
+# over the dev months in every region (typical of the market), at the
+# config's wear cost: scripts/calibrate_twap.py.
+TWAP_DEADBAND = 0.413
+
+
 class TWAPPolicy:
     """Threshold bidding around the forecast's time-weighted average price
-    (TWAP). Every interval, the TWAP of the blended P5MIN + predispatch
-    forecast is the threshold: each band priced below it charges at full power,
-    each band above it discharges at full power, and a band exactly at it does
-    nothing. The bands are the config's fixed daily ladder (config.bidding), so
-    the daily price lock always holds; with a price-taker, the battery charges
-    when the actual price lands at or below the highest band under the TWAP and
-    discharges when it lands at or above the lowest band over it."""
+    (TWAP), net of losses and wear.
 
-    def __init__(self, config: Config):
+    The TWAP of the blended P5MIN + predispatch forecast stands in for the
+    value V of stored energy. Charging 1 MWh at price p stores eta_c MWh, so it
+    pays when p <= eta_c * V - wear; discharging delivers energy that cost
+    1 / eta_d stored MWh, so it pays when p >= V / eta_d + wear. Where V is so
+    negative that the two thresholds cross, they're replaced by their midpoint.
+    `deadband` then scales each threshold's distance from V: 1 trades only
+    where a trade breaks even, 0 trades at V exactly. Full power either side,
+    nothing in between.
+
+    Band prices are locked for the trading day, so at its first decision the
+    policy lays a ladder of 10 load prices around the day's charge threshold
+    and 10 gen prices around its discharge threshold; each interval it puts the
+    full MW in the load band nearest below the current charge threshold and the
+    gen band nearest above the discharge threshold."""
+
+    def __init__(self, config: Config, deadband: float = TWAP_DEADBAND):
         self.config = config
+        self.deadband = deadband
         self.name = "twap"
 
-    def decide(self, obs: Observation) -> BDUBid:
+    def thresholds(self, obs: Observation) -> tuple[float, float]:
         prices, dt_hours = blended_forecast(obs)
-        twap = float(np.sum(prices * dt_hours) / np.sum(dt_hours))
-        cfg, p = self.config, self.config.battery.power_mw
-        m = cfg.market
+        v = float(np.sum(prices * dt_hours) / np.sum(dt_hours))
+        b = self.config.battery
+        charge, discharge = b.charge_eff * v - b.degradation_cost, v / b.discharge_eff + b.degradation_cost
+        if charge > discharge:
+            charge = discharge = (charge + discharge) / 2
+        # Narrow (or widen) the gap between them around V.
+        return v - self.deadband * (v - charge), v + self.deadband * (discharge - v)
 
-        def response(band_prices, mlf):
-            rrn = np.asarray(band_prices, float) / mlf
-            return np.where(rrn < twap, -p, np.where(rrn > twap, p, 0.0))
+    def ladder(self, charge: float, discharge: float) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        """The day's band prices (at the regional reference node): steps of 5%
+        of the thresholds' level (at least $5), the threshold at load band 6
+        and gen band 5, inside the market's limits."""
+        m = self.config.market
+        step = max(5.0, 0.05 * max(abs(charge), abs(discharge)))
+        k = np.arange(N_BANDS)
 
-        bid = curve_bid(cfg.bidding.load_prices, response(cfg.bidding.load_prices, m.load_mlf),
-                        cfg.bidding.gen_prices, response(cfg.bidding.gen_prices, m.gen_mlf), cfg.battery)
-        return conform(bid, obs.energy_mwh, obs.last_mw, cfg.battery)
+        def fit(prices):  # shift (not squash) back inside [MFP, MPC], keeping the steps
+            prices = prices + max(0.0, m.mfp - prices[0]) - max(0.0, prices[-1] - m.mpc)
+            return np.clip(prices, m.mfp, m.mpc)
+
+        return tuple(fit(charge + step * (k - 5))), tuple(fit(discharge + step * (k - 4)))
+
+    def decide(self, obs: Observation) -> BDUBid:
+        cfg, b, m = self.config, self.config.battery, self.config.market
+        charge, discharge = self.thresholds(obs)
+        if obs.locked_prices is None:
+            load_rrn, gen_rrn = self.ladder(charge, discharge)
+            load_prices = tuple(float(p * m.load_mlf) for p in load_rrn)
+            gen_prices = tuple(float(p * m.gen_mlf) for p in gen_rrn)
+        else:
+            load_prices, gen_prices = obs.locked_prices
+        load_rrn = np.asarray(load_prices) / m.load_mlf
+        gen_rrn = np.asarray(gen_prices) / m.gen_mlf
+        load_mw, gen_mw = np.zeros(N_BANDS), np.zeros(N_BANDS)
+        below = np.flatnonzero(load_rrn <= charge)
+        if len(below):
+            load_mw[below[-1]] = b.power_mw
+        # Strictly above the charging band too, or the bid isn't convex (the
+        # thresholds can meet when the TWAP is very negative).
+        floor = load_rrn[below[-1]] if len(below) else -np.inf
+        above = np.flatnonzero((gen_rrn >= discharge) & (gen_rrn > floor))
+        if len(above):
+            gen_mw[above[0]] = b.power_mw
+        r = b.ramp_rate_mw_per_min
+        bid = BDUBid(SideBid(load_prices, tuple(load_mw), float(load_mw.sum()), r, r),
+                     SideBid(gen_prices, tuple(gen_mw), float(gen_mw.sum()), r, r))
+        return conform(bid, obs.energy_mwh, obs.last_mw, b)
