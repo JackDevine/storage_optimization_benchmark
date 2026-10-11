@@ -234,7 +234,18 @@ def run_status(run_id: str) -> dict:
     stale = state.get("saved_at") and time.time() - state["saved_at"] > 120  # harness not saving: process stopped
     holdout_ref = reference.get("holdout_episodes", reference.get("holdout", {})) if reference else {}
     full_ref = reference.get("holdout_full", {}) if reference else {}
+    # Revenue is shown per day (all regions together), so the 3-day episodes and
+    # the full holdout share a unit.
+    episode_days = _window_days(holdout_ref, HOLDOUT_EPISODES)
+    full_days = _window_days(full_ref, HOLDOUT_MONTHS)
+    per_day = lambda net, days: None if net is None else net / days  # noqa: E731
+    for sub in submissions.values():
+        sub["net_revenue_per_day"] = per_day(sub.get("net_revenue"), episode_days)
+    if final_full:
+        final_full["net_revenue_per_day"] = per_day(final_full.get("net_revenue"), full_days)
     other_baselines = _other_baselines(reference)
+    for b in other_baselines:
+        b["holdout_net_revenue_per_day"] = per_day(b.get("holdout_net_revenue"), episode_days)
 
     # Where the run's x-axes end. A live run keeps growing; once the agent has
     # stopped, every axis freezes at that moment. The full-holdout final
@@ -262,7 +273,8 @@ def run_status(run_id: str) -> dict:
         "now_x": now_x,
         "axes_frozen": frozen,
         "baseline_holdout_net_revenue": holdout_ref.get("net_revenue"),
-        "perfect_foresight_holdout_net_revenue": holdout_ref.get("perfect_foresight_net_revenue"),
+        "baseline_holdout_net_revenue_per_day": per_day(holdout_ref.get("net_revenue"), episode_days),
+        "perfect_foresight_holdout_net_revenue_per_day": per_day(holdout_ref.get("perfect_foresight_net_revenue"), episode_days),
         "paused_until": state.get("paused_until"),
         "active_s": state.get("active_seconds"),
         "stopped": stopped,
@@ -285,6 +297,13 @@ def run_status(run_id: str) -> dict:
         "final_full_holdout": final_full,
         "feed": feed[-80:],
     }
+
+
+def _window_days(scores: dict, default_windows) -> float:
+    """Total days in a reference set's windows (as scored for that run), or in
+    the current split's if the run's record doesn't list them."""
+    windows = scores.get("windows") or [[str(a), str(b)] for a, b in default_windows]
+    return sum((pd.Timestamp(b) - pd.Timestamp(a)).total_seconds() / 86400 for a, b in windows) or 1.0
 
 
 def _other_baselines(reference: dict | None) -> list[dict]:
@@ -319,7 +338,7 @@ def compare_runs() -> dict:
             "run_id": run_id, "model": s["model"], "running": s["running"], "comparable": fingerprint == current,
             "started": next((e["t"] for e in run_events(run_id)), None),
             **{k: s[k] for k in ("submissions", "now_x", "axes_frozen", "final_full_holdout",
-                                 "baseline_holdout_pct", "baseline_holdout_net_revenue", "baseline_full_holdout_pct",
+                                 "baseline_holdout_pct", "baseline_holdout_net_revenue_per_day", "baseline_full_holdout_pct",
                                  "other_baselines")},
         })
     return {"fingerprint": current, "runs": runs}
