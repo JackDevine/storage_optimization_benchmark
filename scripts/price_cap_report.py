@@ -109,10 +109,16 @@ def scatter_data() -> dict:
     for x0, x1 in EXCLUDED[:1]:  # the analysis left out only the suspension
         prices = prices[~((prices.SETTLEMENTDATE > x0) & (prices.SETTLEMENTDATE <= x1))]
     prices = prices[prices.day >= pd.Timestamp("2021-10-01")]
-    mapped = PRICE_MAP(prices.RRP.to_numpy(), mpc_at(thresholds, prices.SETTLEMENTDATE - pd.Timedelta(minutes=5)))
+    mpc = mpc_at(thresholds, prices.SETTLEMENTDATE - pd.Timedelta(minutes=5))
+    mapped = PRICE_MAP(prices.RRP.to_numpy(), mpc)
+    # For comparison: every positive price scaled by MPC_now / MPC_then (as in
+    # the analysis's "constant scaling"; the floor hasn't changed, so negative
+    # prices aren't scaled).
+    raw = prices.RRP.to_numpy()
+    scaled = np.where(raw > 0, raw * PRICE_MAP.mpc_now / mpc, raw)
     daily = pd.read_parquet(OUT / "price_cap_daily.parquet", columns=["region", "day", "arbitrage", "n", "map"])
     out = {"regions": REGIONS, "dev_end": str(DEV_END.date())}
-    for key, name, p in [("raw", "raw", prices.RRP.to_numpy()), ("mapped", CHOSEN, mapped)]:
+    for key, name, p in [("raw", "raw", raw), ("mapped", CHOSEN, mapped), ("scaled", "constant scaling", scaled)]:
         f = pd.DataFrame({"region": prices.REGIONID.to_numpy(), "day": prices.day.to_numpy(), "p": p})
         g = f.groupby(["region", "day"]).p
         stats = pd.DataFrame({
@@ -147,7 +153,8 @@ const SC = __SCATTER__;
   const C = { arb: 10, swap: 10, cap300: 0.1, cap1000: 0.1 };
   const color = i => getComputedStyle(document.documentElement).getPropertyValue(`--k${i + 1}`).trim();
   const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-  const panels = { raw: document.getElementById("sc-raw"), mapped: document.getElementById("sc-mapped") };
+  const KEYS = ["raw", "mapped", "scaled"];
+  const panels = Object.fromEntries(KEYS.map(k => [k, document.getElementById("sc-" + k)]));
   let drawn = {};
   function niceTicks(lo, hi, c) {
     const out = [0];
@@ -161,9 +168,9 @@ const SC = __SCATTER__;
   function draw() {
     const yk = ySel.value, yr = yearSel.value;
     const sel = d => d.fy.map((f, i) => (yr === "all" || f === +yr) ? i : -1).filter(i => i >= 0);
-    const idx = { raw: sel(SC.raw), mapped: sel(SC.mapped) };
+    const idx = Object.fromEntries(KEYS.map(k => [k, sel(SC[k])]));
     let xs = [], ys = [];
-    for (const k of ["raw", "mapped"]) for (const i of idx[k]) { xs.push(sym(SC[k].arb[i], C.arb)); ys.push(sym(SC[k][yk][i], C[yk])); }
+    for (const k of KEYS) for (const i of idx[k]) { xs.push(sym(SC[k].arb[i], C.arb)); ys.push(sym(SC[k][yk][i], C[yk])); }
     const pad = (a, b) => [a - (b - a) * 0.04, b + (b - a) * 0.04];
     const [x0, x1] = pad(Math.min(...xs), Math.max(...xs)), [y0, y1] = pad(Math.min(...ys, 0), Math.max(...ys));
     const byYear = yr === "all";
@@ -171,7 +178,7 @@ const SC = __SCATTER__;
     document.getElementById("sc-legend").innerHTML = '<ul class="legend">' + groups.map((g, i) =>
       `<li><span class="swatch" style="background:var(--k${i + 1})"></span>${byYear ? fyLabel(g) : SC.regions[g]}</li>`).join("") + "</ul>";
     document.getElementById("sc-note").textContent = `${idx.raw.length.toLocaleString()} region-months. Colour: ${byYear ? "financial year" : "region"}. Hover a point for its values.`;
-    for (const k of ["raw", "mapped"]) {
+    for (const k of KEYS) {
       const cv = panels[k], dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
       cv.width = W * dpr; cv.height = H * dpr;
       const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
@@ -205,7 +212,7 @@ const SC = __SCATTER__;
     tip.hidden = false;
     tip.style.left = Math.min(best[0] + 10, cv.clientWidth - 190) + "px"; tip.style.top = (best[1] + 34) + "px";
   }
-  for (const k of ["raw", "mapped"]) {
+  for (const k of KEYS) {
     panels[k].addEventListener("mousemove", e => hover(k, e));
     panels[k].addEventListener("mouseleave", () => { const t = panels[k].parentElement.querySelector(".tip"); if (t) t.hidden = true; });
   }
@@ -295,7 +302,7 @@ code {{ font-family: var(--mono); font-size: .9em; }}
 .controls label {{ display: flex; gap: 8px; align-items: center; }}
 select {{ font: inherit; padding: 4px 8px; border: 1px solid var(--rule); border-radius: 4px; background: var(--panel); color: var(--ink); }}
 select:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 1px; }}
-.panels {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 14px; }}
+.panels {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 14px; }}
 .panel {{ position: relative; min-width: 0; }}
 .panel h3 {{ font: 600 .95rem var(--display); margin: 0 0 4px; }}
 .panel canvas {{ width: 100%; aspect-ratio: 1 / 0.85; max-width: 100%; display: block; background: var(--panel);
@@ -341,7 +348,8 @@ not candidates.</p>
 <h2>Month by month: arbitrage against what the month's prices pay</h2>
 <p>Each point is one region-month: the battery's perfect-foresight arbitrage value (x, the mean over the month's
 trading days, each solved separately) against a measure of that month's prices (y, the mean of its daily values),
-on the raw prices and on the mapped ones. A good map moves older days toward the recent pattern
+on the raw prices, on the mapped ones, and, for comparison, with every positive price scaled by the ratio of today's
+cap to the cap in force then (negative prices aren't scaled, since the floor hasn't moved). A good map moves older days toward the recent pattern
 without bending the relationship. Below $1,000 the chosen map changes nothing, so the payout above $1,000 is the
 measure that shows the stretch most directly; the mean price and the $300 payout mix stretched and unchanged
 prices. Both axes are symmetric-log. 2025–26 and 2026–27 are holdout years, shown for context.</p>
@@ -356,6 +364,7 @@ prices. Both axes are symmetric-log. 2025–26 and 2026–27 are holdout years, 
 <div class="panels">
   <div class="panel"><h3>Raw prices</h3><canvas id="sc-raw" aria-label="Scatter of daily arbitrage against the chosen price measure, raw prices"></canvas></div>
   <div class="panel"><h3>Mapped onto $23,200 (knee $1,000)</h3><canvas id="sc-mapped" aria-label="The same scatter on mapped prices"></canvas></div>
+  <div class="panel"><h3>Constant scaling (for comparison)</h3><canvas id="sc-scaled" aria-label="The same scatter with prices scaled by the cap ratio"></canvas></div>
 </div>
 <p class="note" id="sc-note" style="color:var(--muted);font-size:.85rem"></p>
 
