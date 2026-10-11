@@ -91,6 +91,10 @@ by (config, policy, region), where config is the config file's name.
   SOC limits. Every built-in policy (and perfect foresight) passes its bid through it, so the MILP's approximate
   energy accounting on steps that cross zero can't cause non-conformance. Policies may form bids any way they
   like and conform them last; the brief says so.
+- **Wear cost** (`degradation_cost`, $30/MWh on each MWh charged or discharged): calibrated so the LP forecast
+  planner averages one equivalent cycle a day (typical of the market) over every dev month in all regions
+  (`scripts/calibrate_wear.py`; $30.22 gave 0.994 cycles a day, $5 gave 1.93). TWAP at break-even cycles about
+  0.55 times a day under it.
 - `bess/policies.py`:
   - `twap` (**the reference baseline**, `harness/reference_policy`): every 5 minutes it takes the time-weighted
     average price V of the blended P5MIN + predispatch forecast as the value of stored energy, and bids full

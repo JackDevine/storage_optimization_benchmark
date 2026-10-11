@@ -65,15 +65,24 @@ def main() -> None:
         c_lo, c_hi = cycles_per_day("lp", lo, pool), cycles_per_day("lp", hi, pool)
         if not c_hi <= args.target <= c_lo:
             raise SystemExit(f"{args.target} cycles/day isn't between wear ${lo} ({c_lo:.3f}) and ${hi} ({c_hi:.3f})")
+        side = 0  # Illinois variant of regula falsi: halve a stuck endpoint's weight
+        f_lo, f_hi = c_lo - args.target, c_hi - args.target
         for _ in range(10):
-            mid = round(lo + (hi - lo) * (c_lo - args.target) / (c_lo - c_hi), 2)
+            mid = round((lo * f_hi - hi * f_lo) / (f_hi - f_lo), 2)
             c = cycles_per_day("lp", mid, pool)
-            if abs(c - args.target) < 0.01:
+            f = c - args.target
+            if abs(f) < 0.01:
                 break
-            if c > args.target:
-                lo, c_lo = mid, c
+            if f > 0:
+                lo, f_lo = mid, f
+                if side == -1:
+                    f_hi /= 2
+                side = -1
             else:
-                hi, c_hi = mid, c
+                hi, f_hi = mid, f
+                if side == 1:
+                    f_lo /= 2
+                side = 1
         print(f"calibrated wear: ${mid}/MWh")
         if args.check_twap:
             cycles_per_day("twap", mid, pool, deadband=1.0)

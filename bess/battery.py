@@ -15,7 +15,7 @@ class Battery:
     initial_soc_frac: float = 0.5
     # Throughput cost charged on both charge and discharge MWh, to stop the
     # optimiser cycling for negligible spreads.
-    degradation_cost: float = 5.0
+    degradation_cost: float = 30.0
     # Used for the ramp rates in bids built by setpoint_bid.
     ramp_rate_mw_per_min: float = 1.0
 

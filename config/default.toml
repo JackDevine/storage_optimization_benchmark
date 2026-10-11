@@ -9,7 +9,8 @@ discharge_eff = 0.9
 soc_min_frac = 0.05
 soc_max_frac = 0.95
 initial_soc_frac = 0.5
-degradation_cost = 5.0      # $/MWh throughput, charged on both charge and discharge
+degradation_cost = 30.0     # $/MWh throughput, charged on both charge and discharge. Calibrated so the LP
+                            # forecast planner averages 1 cycle a day over the dev months (scripts/calibrate_wear.py)
 ramp_rate_mw_per_min = 1.0  # the unit's ramp rate (MW/min); every bid must state exactly this
 
 [terminal]
