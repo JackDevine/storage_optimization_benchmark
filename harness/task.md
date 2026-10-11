@@ -65,6 +65,9 @@ day. Later bids may change only `band_mw`, `max_avail` and ramp rates; a bid wit
 Helpers in `bess.bid`:
 - `setpoint_bid(mw, battery, market)` is dispatched to exactly `mw` whatever the price, and is always valid.
 - `curve_bid(...)` turns a price-response curve into a valid bid.
+- `conform(bid, obs.energy_mwh, obs.last_mw, battery)` caps each side's `max_avail` so that whatever clears can be
+  delivered and then stopped within the SOC limits. A bid passed through it never causes non-conformance, so you can
+  form bids any way you like and conform them last. The baselines do this.
 
 ## Your policy
 
