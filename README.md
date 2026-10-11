@@ -189,6 +189,18 @@ A model is asked to write a bidding policy. There are two backends, picked by th
   - **Monthly windows:** long periods are scored one calendar month at a time (`month_windows`), each starting
     the battery at 50%, so every (region, month) is a short parallel job and perfect foresight stays a
     month-sized MILP. The dev reference set is every dev month; the full holdout is every holdout month.
+- **Reference scores** (config `ee2a85469681`: $30/MWh wear; % of perfect foresight):
+
+  | Set | `twap` (headline) | `lp_forecast` |
+  |---|---|---|
+  | Every dev month (235 region-months) | 46.3 | 52.8 |
+  | Dev episodes (`dev_eval` default) | 36.7 | 29.4 |
+  | Holdout episodes (submissions) | 38.1 | 40.5 |
+  | Full holdout (final score) | 32.4 | 27.3 |
+
+  On this laptop, scoring TWAP takes 24 s for a submission, 28 s for `dev_eval`'s default episodes, 2.5 min for the
+  full holdout and 9 min for every dev month (the LP about 1.5–2× that). The evaluator runs as many jobs in parallel
+  as both the CPUs and the free memory allow (about 1.2 GB per job, allowing for a torch policy).
 - **Episodes:** submissions are scored on a seeded sample of 3-day episodes (`sample_episodes`), one per holdout
   month (12), each starting at 04:00 with the battery at 50%. All region × episode jobs run in parallel, so a
   submission takes about one episode's simulated time.
