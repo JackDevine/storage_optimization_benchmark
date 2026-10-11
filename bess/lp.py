@@ -8,16 +8,19 @@ Variables per step k: charge c_k, discharge d_k (MW), end-of-step energy e_k
          c_k <= P * u_k,   d_k <= P * (1 - u_k)
          0 <= c_k, d_k,   E_min <= e_k <= E_max
          |(d_k - c_k) - (d_{k-1} - c_{k-1})| <= ramp * step minutes
+         c_k <= P * u_{k-1},   d_k <= P * (1 - u_{k-1})   (5-minute steps)
          e_N + s >= E_target,   s >= 0          (only when penalty > 0)
 
 c~ and d~ are the step's average flows. A 5-minute step follows AEMO's
 straight-line path from the previous step's MW to this step's end-of-interval
 target, so c~_k = (c_{k-1} + c_k) / 2 (the previous MW is `p_prev` for the
-first step). That matches the simulator exactly unless the step crosses zero,
-where it slightly overstates both flows; and the simulator also checks SOC at
-the zero crossing, which the MILP doesn't see. `soc_margin_mwh` keeps planned
-SOC that far inside its limits to absorb both (relaxed to the current SOC if
-the battery is already inside the margin). Longer (predispatch) steps are
+first step). A 5-minute step may not change direction (charge after a
+discharging step or vice versa: the unit passes through 0 MW at the step
+boundary instead), so that is exact; a crossing step would have both flows at
+once, which the plan could exploit to burn energy at negative prices in a way
+the simulator's zero-crossing SOC check then refuses. `soc_margin_mwh` keeps
+planned SOC that far inside its limits for solver tolerances (relaxed to the
+current SOC if the battery is already inside the margin). Longer (predispatch) steps are
 coarse planning steps, so their MW is held flat. Consecutive MW targets differ
 by at most the battery's ramp rate × step length.
 
@@ -114,6 +117,26 @@ def solve_schedule(
     hi[0] += prev
     row_lower = np.concatenate([row_lower, lo])
     row_upper = np.concatenate([row_upper, hi])
+
+    # No change of direction within a straight-line step: if step k-1 charged
+    # (u_{k-1} = 1), step k can't discharge, and vice versa, so the unit passes
+    # through 0 MW at a step boundary. The averaged flows above are then exact
+    # (a crossing step would have both), and the plan never relies on SOC the
+    # simulator's zero-crossing check would refuse. Only 5-minute steps follow
+    # a straight line; the first step's direction is fixed by p_prev.
+    #   c_k - P*u_{k-1} <= 0,   d_k + P*u_{k-1} <= P
+    kk = k[1:][w[1:] > 0]
+    r0 = len(row_lower)
+    rc, rd = r0 + np.arange(len(kk)), r0 + len(kk) + np.arange(len(kk))
+    rows += [rc, rc, rd, rd]
+    cols += [C + kk, U + kk - 1, D + kk, U + kk - 1]
+    vals += [np.ones(len(kk)), np.full(len(kk), -b.power_mw), np.ones(len(kk)), np.full(len(kk), b.power_mw)]
+    row_lower = np.concatenate([row_lower, np.full(2 * len(kk), -inf)])
+    row_upper = np.concatenate([row_upper, np.zeros(len(kk)), np.full(len(kk), b.power_mw)])
+    if w[0] > 0 and prev < 0:
+        col_upper[D] = 0.0
+    elif w[0] > 0 and prev > 0:
+        col_upper[C] = 0.0
 
     if soft_terminal:
         # Last row: e_{N-1} + s >= E_target, with shortfall s penalised.
