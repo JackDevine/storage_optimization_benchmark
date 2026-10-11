@@ -94,8 +94,9 @@ def arbitrage_chart(maps: dict) -> str:
 
 
 def scatter_data() -> dict:
-    """Per region-month: mean daily arbitrage value (from the analysis, raw and
-    under the chosen map) against the month's mean price, $300 cap payout and
+    """Per region-week (ISO weeks, Monday to Sunday, by trading day): mean daily
+    arbitrage value (from the analysis, raw and under the chosen map, and
+    constant scaling) against the week's mean price, $300 cap payout and
     payout above $1,000, each from the same prices. Compact arrays for the page."""
     con = duckdb.connect(str(RAW_DB), read_only=True)
     try:
@@ -127,15 +128,15 @@ def scatter_data() -> dict:
             "cap1000": g.apply(lambda v: np.maximum(v - 1000, 0).mean()),
         }).reset_index()
         d = daily[(daily["map"] == name) & (daily.n == 288)].merge(stats, on=["region", "day"])
-        d["month"] = d.day.dt.to_period("M").dt.to_timestamp()
-        d = (d.groupby(["region", "month"])[["arbitrage", "swap", "cap300", "cap1000"]].mean()
-             .reset_index().rename(columns={"month": "day"}).sort_values(["day", "region"]))
+        d["week"] = d.day.dt.to_period("W-SUN").dt.start_time  # the Monday starting the trading day's ISO week
+        d = (d.groupby(["region", "week"])[["arbitrage", "swap", "cap300", "cap1000"]].mean()
+             .reset_index().rename(columns={"week": "day"}).sort_values(["day", "region"]))
         fy = d.day.dt.year + (d.day.dt.month >= 7)
         out[key] = {
             "arb": d.arbitrage.round(1).tolist(), "swap": d.swap.round(2).tolist(),
             "cap300": d.cap300.round(3).tolist(), "cap1000": d.cap1000.round(3).tolist(),
             "fy": fy.astype(int).tolist(), "region": d.region.map(REGIONS.index).tolist(),
-            "day": d.day.dt.strftime("%b %Y").tolist(),
+            "day": d.day.dt.strftime("week of %d %b %Y").tolist(),
         }
     return out
 
@@ -205,20 +206,20 @@ const SC = __SCATTER__;
     const groups = byYear ? years : SC.regions.map((_, i) => i);
     document.getElementById("sc-legend").innerHTML = '<ul class="legend">' + groups.map((g, i) =>
       `<li><span class="swatch" style="background:var(--k${i + 1})"></span>${byYear ? fyLabel(g) : SC.regions[g]}</li>`).join("") + "</ul>";
-    document.getElementById("sc-note").textContent = `${idx.raw.length.toLocaleString()} region-months. Colour: ${byYear ? "financial year" : "region"}. Hover a point for its values.`;
+    document.getElementById("sc-note").textContent = `${idx.raw.length.toLocaleString()} region-weeks. Colour: ${byYear ? "financial year" : "region"}. Hover a point for its values.`;
     {
       const { g, X, Y } = frame(comb, x0, x1, y0, y1, yk), pts = [];
       if (links.checked) {
-        g.strokeStyle = css("--muted"); g.globalAlpha = 0.35; g.lineWidth = 1;
+        g.strokeStyle = css("--muted"); g.globalAlpha = 0.25; g.lineWidth = 1;
         for (const i of idx.raw) {
           g.beginPath(); g.moveTo(X(SC.raw.arb[i]), Y(SC.raw[yk][i]));
           g.lineTo(X(SC.mapped.arb[i]), Y(SC.mapped[yk][i])); g.lineTo(X(SC.scaled.arb[i]), Y(SC.scaled[yk][i])); g.stroke();
         }
       }
-      g.globalAlpha = 0.85;
+      g.globalAlpha = 0.7;
       for (const [k, , c, shape] of MAPS) {
         g.fillStyle = css(c);
-        for (const i of idx[k]) { const x = X(SC[k].arb[i]), y = Y(SC[k][yk][i]); marker(g, shape, x, y, 4); pts.push([x, y, i, k]); }
+        for (const i of idx[k]) { const x = X(SC[k].arb[i]), y = Y(SC[k][yk][i]); marker(g, shape, x, y, 3); pts.push([x, y, i, k]); }
       }
       g.globalAlpha = 1;
       drawn.combined = { pts, yk };
@@ -226,11 +227,11 @@ const SC = __SCATTER__;
     for (const k of KEYS) {
       const { g, X, Y } = frame(panels[k], x0, x1, y0, y1, yk);
       const d = SC[k], pts = [];
-      g.globalAlpha = 0.8;
+      g.globalAlpha = 0.65;
       for (const i of idx[k]) {
         const gi = byYear ? years.indexOf(d.fy[i]) : d.region[i];
         const x = X(d.arb[i]), y = Y(d[yk][i]);
-        g.fillStyle = color(gi); g.beginPath(); g.arc(x, y, 4, 0, 2 * Math.PI); g.fill();
+        g.fillStyle = color(gi); g.beginPath(); g.arc(x, y, 2.8, 0, 2 * Math.PI); g.fill();
         pts.push([x, y, i, k]);
       }
       g.globalAlpha = 1;
@@ -389,9 +390,10 @@ the cap raises it; the question is how much of that is the cap and how much is i
 just above the knee come out <i>lower</i> than they were; that's why those rows change value least, and why they're
 not candidates.</p>
 
-<h2>Month by month: arbitrage against what the month's prices pay</h2>
-<p>Each point is one region-month: the battery's perfect-foresight arbitrage value (x, the mean over the month's
-trading days, each solved separately) against a measure of that month's prices (y, the mean of its daily values),
+<h2>Week by week: arbitrage against what the week's prices pay</h2>
+<p>Each point is one region-week (ISO weeks, Monday to Sunday, grouping trading days by their date): the battery's
+perfect-foresight arbitrage value (x, the mean over the week's trading days, each solved separately) against a
+measure of that week's prices (y, the mean of its daily values),
 on the raw prices, on the mapped ones, and, for comparison, with every positive price scaled by the ratio of today's
 cap to the cap in force then (negative prices aren't scaled, since the floor hasn't moved). A good map moves older days toward the recent pattern
 without bending the relationship. Below $1,000 the chosen map changes nothing, so the payout above $1,000 is the
@@ -399,8 +401,8 @@ measure that shows the stretch most directly; the mean price and the $300 payout
 prices. Both axes are symmetric-log. 2025–26 and 2026–27 are holdout years, shown for context.</p>
 <div class="controls">
   <label for="sc-y">Y axis <select id="sc-y">
-    <option value="cap1000">Payout above $1,000/MWh ($/MWh, monthly mean)</option>
-    <option value="cap300">Payout above $300/MWh ($/MWh, monthly mean)</option>
+    <option value="cap1000">Payout above $1,000/MWh ($/MWh, weekly mean)</option>
+    <option value="cap300">Payout above $300/MWh ($/MWh, weekly mean)</option>
     <option value="swap">Mean price ($/MWh)</option></select></label>
   <label for="sc-year">Year <select id="sc-year"></select></label>
   <label for="sc-region">Region <select id="sc-region"></select></label>
@@ -408,7 +410,7 @@ prices. Both axes are symmetric-log. 2025–26 and 2026–27 are holdout years, 
 <div class="panel combined">
   <h3>All three on one figure</h3>
   <ul class="legend" id="sc-combined-legend"></ul>
-  <label class="links" for="sc-links"><input type="checkbox" id="sc-links" checked> Join each region-month's three points</label>
+  <label class="links" for="sc-links"><input type="checkbox" id="sc-links" checked> Join each region-week's three points</label>
   <canvas id="sc-combined" aria-label="Raw, $1,000-knee and constant-scaling points on one scatter"></canvas>
 </div>
 <p style="margin-top:1.2rem">The same points, one map per panel, coloured by year or region:</p>
