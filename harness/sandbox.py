@@ -22,6 +22,7 @@ The policy and agent-bash sandboxes start from an empty environment, so API
 keys and tokens in the harness's environment never reach agent code.
 """
 
+import os
 import shlex
 from pathlib import Path
 
@@ -34,12 +35,16 @@ BUNDLED_CLI = Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
 VENV_BIN = PROJECT_ROOT / ".venv" / "bin"
 
 
+def _env() -> dict[str, str]:
+    """The minimal environment sandboxed processes get (no API keys or tokens)."""
+    return {"PATH": f"{VENV_BIN}:/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "LANG": "C.UTF-8",
+            "PYTHONUNBUFFERED": "1", "VIRTUAL_ENV": str(PROJECT_ROOT / ".venv")}
+
+
 def _clean_env() -> list[str]:
     """Drop the harness's environment (API keys, tokens) and set a minimal one."""
-    env = {"PATH": f"{VENV_BIN}:/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "LANG": "C.UTF-8",
-           "PYTHONUNBUFFERED": "1", "VIRTUAL_ENV": str(PROJECT_ROOT / ".venv")}
     args = ["--clearenv"]
-    for k, v in env.items():
+    for k, v in _env().items():
         args += ["--setenv", k, v]
     return args
 
@@ -84,6 +89,54 @@ def agent_bash_sandbox(workspace: Path, tmp_dir: Path) -> list[str]:
         "--bind", str(workspace), str(workspace),
         "--chdir", str(workspace),
     ]
+
+
+class PersistentSandbox:
+    """One agent-bash sandbox kept alive for a whole OpenRouter run, so that,
+    as with Claude Code's Bash, a background process an agent starts keeps
+    running after the command that started it returns. A holder process
+    (`sleep infinity` under agent_bash_sandbox) owns the sandbox's namespaces;
+    each command is entered into them with nsenter, with the same minimal
+    environment. The holder dies with the harness (bwrap --die-with-parent)."""
+
+    def __init__(self, workspace: Path, tmp_dir: Path):
+        self.workspace, self.tmp_dir = Path(workspace).resolve(), Path(tmp_dir).resolve()
+        self._holder = None
+        self._pid = None
+
+    def _start(self) -> None:
+        import subprocess
+        import time
+
+        self._holder = subprocess.Popen(agent_bash_sandbox(self.workspace, self.tmp_dir) + ["sleep", "infinity"],
+                                        start_new_session=True, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(100):  # bwrap forks the sandboxed process; its pid is the one to enter
+            kids = Path(f"/proc/{self._holder.pid}/task/{self._holder.pid}/children")
+            pids = kids.read_text().split() if kids.exists() else []
+            if pids:
+                self._pid = pids[-1]
+                return
+            time.sleep(0.05)
+        raise RuntimeError("the agent sandbox didn't start")
+
+    def command(self, command: str) -> list[str]:
+        """argv that runs `command` with bash inside the sandbox."""
+        if self._holder is None or self._holder.poll() is not None:
+            self._start()
+        env = [f"{k}={v}" for k, v in _env().items()]
+        return ["nsenter", "-t", self._pid, "-U", "-m", "-n", "-p", "-i", "-u", "--preserve-credentials",
+                f"--wd={self.workspace}", "env", "-i", *env, "bash", "-c", command]
+
+    def close(self) -> None:
+        import signal
+
+        if self._holder is not None and self._holder.poll() is None:
+            try:
+                os.killpg(self._holder.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self._holder = None
 
 
 def write_agent_cli_wrapper(path: Path, workspace: Path, config_dir: Path) -> Path:

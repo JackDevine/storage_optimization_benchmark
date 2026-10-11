@@ -38,7 +38,7 @@ from harness.run_agent import (
     Run,
     _truncate,
 )
-from harness.sandbox import PROJECT_ROOT, agent_bash_sandbox
+from harness.sandbox import PROJECT_ROOT, PersistentSandbox
 
 API_URL = "https://openrouter.ai/api/v1"
 KEY_FILE = Path.home() / ".config" / "storage-benchmark" / "openrouter_api_key"
@@ -150,6 +150,7 @@ class OpenRouterRun(Run):
     billing = "openrouter"
 
     def __init__(self, args):
+        self.sandbox = None  # the agent's persistent bash sandbox, started on its first command
         super().__init__(args)
         self.messages: list[dict] = []
         self.messages_path = self.dir / "logs" / "messages.jsonl"
@@ -393,15 +394,21 @@ class OpenRouterRun(Run):
             raise ToolError(f"{path} is outside the allowed paths: {'writes' if write else 'reads'} must be {where}.")
         return real
 
+    def end_agent(self) -> None:
+        if self.sandbox is not None:  # stops any background processes the agent left running
+            self.sandbox.close()
+
     async def tool_bash(self, args: dict) -> str:
         command = args.get("command")
         if not command:
             raise ToolError("`command` is required.")
         timeout = min(float(args.get("timeout_s") or BASH_DEFAULT_S), BASH_MAX_S)
-        tmp_dir = self.dir / "agent_tmp"  # the sandbox's /tmp, kept between commands
-        tmp_dir.mkdir(exist_ok=True)
+        if self.sandbox is None:
+            tmp_dir = self.dir / "agent_tmp"  # the sandbox's /tmp
+            tmp_dir.mkdir(exist_ok=True)
+            self.sandbox = PersistentSandbox(self.workspace, tmp_dir)
         proc = await asyncio.create_subprocess_exec(
-            *agent_bash_sandbox(self.workspace, tmp_dir), "bash", "-c", command,
+            *self.sandbox.command(command),
             stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
@@ -427,7 +434,12 @@ class OpenRouterRun(Run):
         if note:
             self._kill(proc)
             await proc.wait()
-        await reader
+        # A background process the command started may still hold its output
+        # open; don't wait for it.
+        try:
+            await asyncio.wait_for(reader, 2)
+        except asyncio.TimeoutError:
+            reader.cancel()
         out = b"".join(chunks).decode(errors="replace")
         status = note or f"exit code {proc.returncode}"
         return f"{_clip(out)}\n[{status}]" if out else f"[{status}, no output]"

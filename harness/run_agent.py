@@ -518,8 +518,12 @@ class Run:
             watchdog.cancel()
             self.stop_clock()
             self.save_state()
+            self.end_agent()
         await self.final_evaluation()
         self.write_summary()
+
+    def end_agent(self) -> None:
+        """Called when the agent's work is over (before the final evaluation)."""
 
     async def ensure_reference(self) -> None:
         """Compute baseline scores for this configuration if they aren't cached yet
