@@ -47,9 +47,12 @@ def solve_schedule(
     p_prev: float = 0.0,
     soc_margin_mwh: float = 0.0,
     time_limit: float | None = None,
+    integer: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (charge_mw, discharge_mw, energy_mwh) per step. With `time_limit`
-    (seconds), the best solution found by then is returned. `p_prev` is the
+    (seconds), the best solution found by then is returned. `integer=False`
+    relaxes the binaries to an LP (about 5x faster; it may then charge and
+    discharge in the same step). `p_prev` is the
     unit's MW now (+ = discharge), where the first step's straight line starts."""
     n = len(prices)
     p, dt, b = np.asarray(prices, float), np.asarray(dt_hours, float), battery
@@ -77,7 +80,7 @@ def solve_schedule(
     e_hi = max(b.e_max - soc_margin_mwh, min(e0, b.e_max))
     col_lower = np.concatenate([np.zeros(2 * n), np.full(n, e_lo), np.zeros(n)])
     col_upper = np.concatenate([np.full(2 * n, b.power_mw), np.full(n, e_hi), np.ones(n)])
-    integrality = np.concatenate([np.zeros(3 * n), np.ones(n)])
+    integrality = np.concatenate([np.zeros(3 * n), np.full(n, 1 if integer else 0)])
 
     # Rows 0..n-1, energy balance:
     #   e_k - e_{k-1} + own_k*(d_k/eta_d - eta_c*c_k) + nxt_{k-1}*(d_{k-1}/eta_d - eta_c*c_{k-1}) = 0

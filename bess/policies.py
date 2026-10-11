@@ -85,15 +85,19 @@ def blended_forecast(obs: Observation) -> tuple[np.ndarray, np.ndarray]:
 
 
 class MILPForecastPolicy:
-    def __init__(self, config: Config):
+    """`integer=False` plans with the LP relaxation instead (lp_forecast)."""
+
+    def __init__(self, config: Config, integer: bool = True):
         self.config = config
-        self.name = "milp_forecast"
+        self.integer = integer
+        self.name = "milp_forecast" if integer else "lp_forecast"
 
     def decide(self, obs: Observation) -> BDUBid:
         prices, dt_hours = blended_forecast(obs)
         cfg = self.config
         c, d, _ = solve_schedule(
-            prices, dt_hours, cfg.battery, obs.energy_mwh, cfg.terminal, cfg.mip_rel_gap, **dynamics(cfg, obs.last_mw)
+            prices, dt_hours, cfg.battery, obs.energy_mwh, cfg.terminal, cfg.mip_rel_gap, **dynamics(cfg, obs.last_mw),
+            integer=self.integer,
         )
         bid = setpoint_bid(float(d[0] - c[0]), cfg.battery, cfg.market)
         return conform(bid, obs.energy_mwh, obs.last_mw, cfg.battery)
