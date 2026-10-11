@@ -167,6 +167,31 @@ const SC = __SCATTER__;
     return [...new Set(out)].filter(v => sym(v, c) >= lo && sym(v, c) <= hi);
   }
   const fmt = v => { const a = Math.abs(v); return (v < 0 ? "−" : "") + "$" + (a >= 1000 ? (a / 1000) + "k" : a >= 1 ? a.toFixed(0) : a.toString()); };
+  const MAPS = [["raw", "Raw prices", "--s1", "circle"], ["mapped", "$1,000 knee (chosen)", "--s4", "square"],
+                ["scaled", "Constant scaling", "--s2", "triangle"]];
+  const comb = document.getElementById("sc-combined"), links = document.getElementById("sc-links");
+  document.getElementById("sc-combined-legend").innerHTML = MAPS.map(([, lab, c, shape]) =>
+    `<li><svg class="marker" viewBox="0 0 12 12">${shape === "circle" ? '<circle cx="6" cy="6" r="5"' :
+      shape === "square" ? '<rect x="1.5" y="1.5" width="9" height="9"' : '<path d="M6 1 L11 11 L1 11 Z"'} fill="var(${c})"/></svg>${lab}</li>`).join("");
+  function marker(g, shape, x, y, r) {
+    g.beginPath();
+    if (shape === "circle") g.arc(x, y, r, 0, 2 * Math.PI);
+    else if (shape === "square") g.rect(x - r * 0.85, y - r * 0.85, r * 1.7, r * 1.7);
+    else { g.moveTo(x, y - r * 1.1); g.lineTo(x + r, y + r * 0.8); g.lineTo(x - r, y + r * 0.8); g.closePath(); }
+    g.fill();
+  }
+  function frame(cv, x0, x1, y0, y1, yk) {
+    const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+    cv.width = W * dpr; cv.height = H * dpr;
+    const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    const L = 52, R = 10, T = 10, B = 34;
+    const X = v => L + (sym(v, C.arb) - x0) / (x1 - x0) * (W - L - R), Y = v => T + (y1 - sym(v, C[yk])) / (y1 - y0) * (H - T - B);
+    g.font = "11px " + css("--mono"); g.fillStyle = css("--muted"); g.strokeStyle = css("--rule"); g.lineWidth = 1;
+    for (const v of niceTicks(x0, x1, C.arb)) { const x = X(v); g.beginPath(); g.moveTo(x, T); g.lineTo(x, H - B); g.stroke(); g.textAlign = "center"; g.fillText(fmt(v), x, H - B + 14); }
+    for (const v of niceTicks(y0, y1, C[yk])) { const y = Y(v); g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke(); g.textAlign = "right"; g.fillText(fmt(v), L - 6, y + 4); }
+    g.textAlign = "center"; g.fillText("arbitrage value, $/day", L + (W - L - R) / 2, H - 4);
+    return { g, X, Y };
+  }
   function draw() {
     const yk = ySel.value, yr = yearSel.value, rg = regionSel.value;
     const sel = d => d.fy.map((f, i) => ((yr === "all" || f === +yr) && (rg === "all" || d.region[i] === +rg)) ? i : -1)
@@ -181,44 +206,56 @@ const SC = __SCATTER__;
     document.getElementById("sc-legend").innerHTML = '<ul class="legend">' + groups.map((g, i) =>
       `<li><span class="swatch" style="background:var(--k${i + 1})"></span>${byYear ? fyLabel(g) : SC.regions[g]}</li>`).join("") + "</ul>";
     document.getElementById("sc-note").textContent = `${idx.raw.length.toLocaleString()} region-months. Colour: ${byYear ? "financial year" : "region"}. Hover a point for its values.`;
+    {
+      const { g, X, Y } = frame(comb, x0, x1, y0, y1, yk), pts = [];
+      if (links.checked) {
+        g.strokeStyle = css("--muted"); g.globalAlpha = 0.35; g.lineWidth = 1;
+        for (const i of idx.raw) {
+          g.beginPath(); g.moveTo(X(SC.raw.arb[i]), Y(SC.raw[yk][i]));
+          g.lineTo(X(SC.mapped.arb[i]), Y(SC.mapped[yk][i])); g.lineTo(X(SC.scaled.arb[i]), Y(SC.scaled[yk][i])); g.stroke();
+        }
+      }
+      g.globalAlpha = 0.85;
+      for (const [k, , c, shape] of MAPS) {
+        g.fillStyle = css(c);
+        for (const i of idx[k]) { const x = X(SC[k].arb[i]), y = Y(SC[k][yk][i]); marker(g, shape, x, y, 4); pts.push([x, y, i, k]); }
+      }
+      g.globalAlpha = 1;
+      drawn.combined = { pts, yk };
+    }
     for (const k of KEYS) {
-      const cv = panels[k], dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
-      cv.width = W * dpr; cv.height = H * dpr;
-      const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
-      const L = 52, R = 10, T = 10, B = 34;
-      const X = v => L + (sym(v, C.arb) - x0) / (x1 - x0) * (W - L - R), Y = v => T + (y1 - sym(v, C[yk])) / (y1 - y0) * (H - T - B);
-      g.font = "11px " + css("--mono"); g.fillStyle = css("--muted"); g.strokeStyle = css("--rule"); g.lineWidth = 1;
-      for (const v of niceTicks(x0, x1, C.arb)) { const x = X(v); g.beginPath(); g.moveTo(x, T); g.lineTo(x, H - B); g.stroke(); g.textAlign = "center"; g.fillText(fmt(v), x, H - B + 14); }
-      for (const v of niceTicks(y0, y1, C[yk])) { const y = Y(v); g.beginPath(); g.moveTo(L, y); g.lineTo(W - R, y); g.stroke(); g.textAlign = "right"; g.fillText(fmt(v), L - 6, y + 4); }
-      g.textAlign = "center"; g.fillText("arbitrage value, $/day", L + (W - L - R) / 2, H - 4);
+      const { g, X, Y } = frame(panels[k], x0, x1, y0, y1, yk);
       const d = SC[k], pts = [];
       g.globalAlpha = 0.8;
       for (const i of idx[k]) {
         const gi = byYear ? years.indexOf(d.fy[i]) : d.region[i];
         const x = X(d.arb[i]), y = Y(d[yk][i]);
         g.fillStyle = color(gi); g.beginPath(); g.arc(x, y, 4, 0, 2 * Math.PI); g.fill();
-        pts.push([x, y, i]);
+        pts.push([x, y, i, k]);
       }
       g.globalAlpha = 1;
       drawn[k] = { pts, yk };
     }
   }
   function hover(k, ev) {
-    const cv = panels[k], tip = cv.parentElement.querySelector(".tip") || cv.parentElement.appendChild(Object.assign(document.createElement("div"), { className: "tip" }));
+    const cv = k === "combined" ? comb : panels[k], tip = cv.parentElement.querySelector(".tip") || cv.parentElement.appendChild(Object.assign(document.createElement("div"), { className: "tip" }));
     const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
     let best = null, bd = 64;
-    for (const [x, y, i] of drawn[k].pts) { const dd = (x - mx) ** 2 + (y - my) ** 2; if (dd < bd) { bd = dd; best = [x, y, i]; } }
+    for (const [x, y, i, mk] of drawn[k].pts) { const dd = (x - mx) ** 2 + (y - my) ** 2; if (dd < bd) { bd = dd; best = [x, y, i, mk]; } }
     if (!best) { tip.hidden = true; return; }
-    const d = SC[k], i = best[2], yk = drawn[k].yk;
+    const d = SC[best[3]], i = best[2], yk = drawn[k].yk;
     const names = { swap: "mean price", cap300: "payout above $300", cap1000: "payout above $1,000" };
-    tip.innerHTML = `${SC.regions[d.region[i]]} ${d.day[i]}<br>arbitrage $${d.arb[i].toLocaleString()}/day (mean)<br>${names[yk]} $${d[yk][i].toLocaleString()}/MWh`;
+    const mapName = k === "combined" ? MAPS.find(m => m[0] === best[3])[1] + "<br>" : "";
+    tip.innerHTML = `${mapName}${SC.regions[d.region[i]]} ${d.day[i]}<br>arbitrage $${d.arb[i].toLocaleString()}/day (mean)<br>${names[yk]} $${d[yk][i].toLocaleString()}/MWh`;
     tip.hidden = false;
     tip.style.left = Math.min(best[0] + 10, cv.clientWidth - 190) + "px"; tip.style.top = (best[1] + 34) + "px";
   }
-  for (const k of KEYS) {
-    panels[k].addEventListener("mousemove", e => hover(k, e));
-    panels[k].addEventListener("mouseleave", () => { const t = panels[k].parentElement.querySelector(".tip"); if (t) t.hidden = true; });
+  for (const k of [...KEYS, "combined"]) {
+    const cv = k === "combined" ? comb : panels[k];
+    cv.addEventListener("mousemove", e => hover(k, e));
+    cv.addEventListener("mouseleave", () => { const t = cv.parentElement.querySelector(".tip"); if (t) t.hidden = true; });
   }
+  links.addEventListener("change", draw);
   ySel.addEventListener("change", draw); yearSel.addEventListener("change", draw);
   regionSel.addEventListener("change", draw);
   window.addEventListener("resize", draw);
@@ -313,7 +350,10 @@ select:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 1px; }
   border: 1px solid var(--rule); border-radius: 4px; }}
 .tip {{ position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--rule); border-radius: 4px;
   padding: 6px 8px; font: 12px/1.4 var(--mono); box-shadow: 0 2px 8px rgb(0 0 0 / .15); white-space: nowrap; z-index: 2; }}
-.c1 {{ --c: var(--k1); }}
+.combined {{ margin-bottom: .4rem; }}
+.combined canvas {{ aspect-ratio: 1 / 0.62; }}
+.links {{ display: inline-flex; gap: 6px; align-items: center; font-size: .85rem; color: var(--muted); margin: 2px 0 6px; }}
+.marker {{ display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: -1px; }}
 </style>
 <main>
 <div class="eyebrow">Storage optimisation benchmark · data preparation</div>
@@ -365,6 +405,13 @@ prices. Both axes are symmetric-log. 2025–26 and 2026–27 are holdout years, 
   <label for="sc-year">Year <select id="sc-year"></select></label>
   <label for="sc-region">Region <select id="sc-region"></select></label>
 </div>
+<div class="panel combined">
+  <h3>All three on one figure</h3>
+  <ul class="legend" id="sc-combined-legend"></ul>
+  <label class="links" for="sc-links"><input type="checkbox" id="sc-links" checked> Join each region-month's three points</label>
+  <canvas id="sc-combined" aria-label="Raw, $1,000-knee and constant-scaling points on one scatter"></canvas>
+</div>
+<p style="margin-top:1.2rem">The same points, one map per panel, coloured by year or region:</p>
 <div id="sc-legend"></div>
 <div class="panels">
   <div class="panel"><h3>Raw prices</h3><canvas id="sc-raw" aria-label="Scatter of daily arbitrage against the chosen price measure, raw prices"></canvas></div>
