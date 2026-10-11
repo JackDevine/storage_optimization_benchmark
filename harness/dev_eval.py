@@ -85,6 +85,6 @@ if __name__ == "__main__":
     if reference.exists() and sorted(args.regions) == sorted(REGIONS):
         ref = json.loads(reference.read_text())
         if not window and not args.full and "episodes_pct_of_perfect" in ref:
-            print(f"Baseline (milp_forecast) on the same dev episodes: {ref['episodes_pct_of_perfect']:.1f}%")
+            print(f"Baseline (TWAP) on the same dev episodes: {ref['episodes_pct_of_perfect']:.1f}%")
         elif args.full:
-            print(f"Baseline (milp_forecast) on every dev month: {ref['pct_of_perfect']:.1f}%")
+            print(f"Baseline (TWAP) on every dev month: {ref['pct_of_perfect']:.1f}%")

@@ -195,10 +195,10 @@ class PerfectForesight:
         return conform(bid, obs.energy_mwh, obs.last_mw, self.config.battery)
 
 
-# TWAPPolicy's deadband scale, calibrated so the policy averages one cycle a day
-# over the dev months in every region (typical of the market), at the
-# config's wear cost: scripts/calibrate_twap.py.
-TWAP_DEADBAND = 0.413
+# TWAPPolicy's deadband scale: 1 trades only where a round trip breaks even
+# after losses and the config's wear cost. (The wear cost itself is calibrated
+# so the LP planner averages one cycle a day: scripts/calibrate_wear.py.)
+TWAP_DEADBAND = 1.0
 
 
 class TWAPPolicy:

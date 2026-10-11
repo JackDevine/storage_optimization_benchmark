@@ -86,10 +86,22 @@ by (config, policy, region), where config is the config file's name.
   from its `RUN_DATETIME` (one interval conservative) and a predispatch run from its `LASTCHANGED`.
 - `bess/lp.py`: the arbitrage MILP (HiGHS). A binary per step makes charge and discharge mutually exclusive.
   Without it, at negative prices the solver would charge and discharge at once to burn energy through
-  round-trip losses.
+  round-trip losses. `integer=False` solves the LP relaxation instead, about 5× faster.
+- `bess/bid.py: conform` caps each side's MaxAvail so whatever clears can be delivered and then stopped within the
+  SOC limits. Every built-in policy (and perfect foresight) passes its bid through it, so the MILP's approximate
+  energy accounting on steps that cross zero can't cause non-conformance. Policies may form bids any way they
+  like and conform them last; the brief says so.
 - `bess/policies.py`:
-  - `milp_forecast` (baseline): every 5 minutes it joins the latest P5MIN run (5-min steps) to the latest
-    predispatch run (30-min steps), solves the MILP, and submits the first interval's MW as a `setpoint_bid`.
+  - `twap` (**the reference baseline**, `harness/reference_policy`): every 5 minutes it takes the time-weighted
+    average price V of the blended P5MIN + predispatch forecast as the value of stored energy, and bids full
+    charge at prices at or below η_c·V − wear and full discharge at or above V/η_d + wear: trades that break even
+    after round-trip losses and wear. Band prices are set once per trading day, in steps around that day's
+    thresholds, and each interval the MW goes in the bands nearest the current thresholds. About 0.5 ms per
+    decision.
+  - `milp_forecast` / `lp_forecast` (the second baseline is the LP, `harness/lp_policy`): every 5 minutes it joins
+    the latest P5MIN run (5-min steps) to the latest predispatch run (30-min steps), solves the MILP (or LP), and
+    submits the first interval's MW as a `setpoint_bid`. If a P5MIN run is missing from AEMO's archive, the next
+    hour is priced from predispatch.
   - `milp_bid_curve`: submits a real price-band bid.
     - The day's 20 band prices (10 load and 10 gen, interleaved, from `[bidding]` in the config) are the
       scenarios for the next interval's price.
@@ -103,7 +115,8 @@ by (config, policy, region), where config is the config file's name.
       band prices it rounds towards doing less, so it never dispatches more than the MILP wanted at that price.
   - `perfect_foresight`: the same MILP solved once over actual prices. It's the ceiling that
     `pct_of_perfect` is measured against.
-- `bess/static_bid.py`: the static bid baselines, which use no forecasts at all.
+- `bess/static_bid.py`: the static bid baselines, which use no forecasts at all. *Parked:* their parameters were
+  fitted to the old two-month split, so they aren't scored as baselines until they're refitted.
   - **The bid:** 10 load bands and 10 gen bands with prices fixed for all time. Every load price is below every
     gen price, so the bid is always convex and never charges and discharges at once.
   - **Three variants**, by what the band MW may depend on:

@@ -14,7 +14,7 @@ specifically.
 ## The battery and the market
 
 - **Battery:** 1 MW / 2 MWh. 90% efficiency charging and 90% discharging (81% round trip). State of charge must stay
-  within 5–95% (0.1–1.9 MWh). It starts each region at 50%. Degradation costs $5/MWh of throughput, charged on both
+  within 5–95% (0.1–1.9 MWh). It starts each region at 50%. Degradation costs ${degradation_cost:g}/MWh of throughput, charged on both
   charge and discharge. The full spec is in `config.toml`.
 - **Price-taker:** the battery is small enough that it never moves the price. Each interval, your bid is cleared
   against the actual dispatch price, the regional reference price (RRP), and revenue is MW × 5/60 h × RRP.
@@ -125,13 +125,13 @@ occasional gaps, so the latest run can be stale: e.g. there are no P5MIN runs fr
   prints its location, and `harness/` sits beside it. It contains:
   - the simulator (`sim.py`)
   - bids (`bid.py`)
-  - an arbitrage MILP (`lp.py`, solved with HiGHS via `highspy`)
+  - an arbitrage MILP/LP (`lp.py`, solved with HiGHS via `highspy`)
   - the baseline policies (`policies.py`)
 
-  `harness/reference_policy/policy.py` is the baseline in the submission format: it re-solves an MILP on the forecast
-  every interval and bids the first interval's MW as a setpoint. `harness/static_bid_policies/` holds three more
-  baselines, each a fixed bid curve per region fitted to the dev prices. Because they're fitted to the dev data,
-  their dev scores flatter them.
+  `harness/reference_policy/policy.py` is the baseline in the submission format (`TWAPPolicy`): it treats the time-
+  weighted average price of the forecast as the value of stored energy, and bids to charge at full power below it and
+  discharge at full power above it, by enough to cover round-trip losses and wear. `harness/lp_policy/policy.py` is a
+  second baseline: it re-solves an LP on the forecast every interval and bids the first interval's MW as a setpoint.
 - Python libraries: numpy, pandas, duckdb, highspy, pyarrow. There is no network access, so you can't install
   anything else.
 - The `submit_policy` tool scores the current workspace on the **holdout episodes** and tells you:

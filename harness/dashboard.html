@@ -576,7 +576,7 @@ function drawCompare(data) {
 
 // The static bid baselines, as legend entries (dash-dot, muted ink) rather than
 // labelled lines: their scores sit close together, so labels would collide.
-const BASELINE_NAMES = { static_bid: "static bid", static_bid_tod: "static bid, time of day",
+const BASELINE_NAMES = { lp_forecast: "LP planner", static_bid: "static bid", static_bid_tod: "static bid, time of day",
   static_bid_tod_soc: "static bid, time of day + SOC" };
 const BASELINE_DASHES = ["dashdot", "dot", "longdashdot"];
 function otherBaselineTraces(traces, list, yKey) {

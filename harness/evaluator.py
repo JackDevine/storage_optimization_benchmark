@@ -37,18 +37,19 @@ from harness.sandbox import PROJECT_ROOT, policy_sandbox
 from harness.splits import DATA_VERSION, DEV_EPISODES, DEV_MONTHS, HOLDOUT_EPISODES, HOLDOUT_MONTHS, REGIONS, Window
 
 REFERENCE_POLICY_DIR = Path(__file__).resolve().parent / "reference_policy"
-# Further baselines, scored alongside the reference policy when their fitted
-# parameters exist (scripts/fit_static_bids.py): name -> policy directory.
-STATIC_BID_DIR = Path(__file__).resolve().parent / "static_bid_policies"
+REFERENCE_NAME = "twap"  # the headline baseline: bess.policies.TWAPPolicy
+# Further baselines, scored alongside the reference policy: name -> policy
+# directory. (The static-bid baselines in static_bid_policies/ are parked: their
+# parameters were fitted to the old two-month split.)
 OTHER_BASELINES = {
-    "static_bid": STATIC_BID_DIR / "static",
-    "static_bid_tod": STATIC_BID_DIR / "tod",
-    "static_bid_tod_soc": STATIC_BID_DIR / "tod_soc",
+    "lp_forecast": Path(__file__).resolve().parent / "lp_policy",
 }
 REFERENCE_DIR = PROJECT_ROOT / "data" / "reference_scores"
 REFERENCE_PATH = PROJECT_ROOT / "data" / "reference_scores.json"  # legacy: one file for the default config
 # Bump when the simulator's scoring rules change, so baselines get recomputed.
-SIM_VERSION = 2  # 2: straight-line dispatch trajectory and the unit's ramp rate (1: flat MW, bid's own ramp rates; removed)
+# 3: built-in policies and perfect foresight conform their bids (bess.bid.conform); TWAP headline baseline.
+# 2: straight-line dispatch trajectory and the unit's ramp rate (1: flat MW, bid's own ramp rates; removed).
+SIM_VERSION = 3
 
 
 def config_fingerprint(config: Config) -> str:
@@ -229,7 +230,7 @@ REFERENCE_SETS = {
 
 
 def compute_reference(config: Config) -> dict:
-    """Baseline (milp_forecast) scores on the dev and holdout windows and
+    """Reference policy (TWAP) scores on the dev and holdout windows and
     episodes, under `config`, plus the other baselines (see update_reference).
     Cached per configuration, so a run is always compared with a baseline that
     faced the same rules (e.g. ramp rate)."""
@@ -249,14 +250,20 @@ def _save_reference(config: Config, scores: dict) -> None:
 
 
 def _params_sha(policy_dir: Path) -> str | None:
-    params = policy_dir / "params.json"
-    return hashlib.sha1(params.read_bytes()).hexdigest()[:12] if params.exists() else None
+    """Identifies a baseline policy directory's files (code and any fitted parameters)."""
+    files = sorted(p for p in Path(policy_dir).rglob("*") if p.is_file() and "__pycache__" not in p.parts)
+    if not files:
+        return None
+    h = hashlib.sha1()
+    for p in files:
+        h.update(str(p.relative_to(policy_dir)).encode() + p.read_bytes())
+    return h.hexdigest()[:12]
 
 
 def update_reference(config: Config) -> dict:
     """Add the other baselines (OTHER_BASELINES) to the cached scores for
     `config`, computing any that are missing or whose fitted parameters have
-    changed since. The milp_forecast scores stay at the top level; the others
+    changed since. The reference policy's (REFERENCE_NAME) scores stay at the top level; the others
     go under "other_baselines"[name][set name]. Computes everything if nothing
     is cached yet."""
     scores = load_reference(config)
@@ -282,8 +289,8 @@ def update_reference(config: Config) -> dict:
 
 def baseline_pcts(reference: dict, set_name: str) -> dict[str, float]:
     """% of perfect foresight on one reference set, for every baseline in
-    `reference`: {"milp_forecast": ..., "static_bid": ..., ...}."""
-    out = {"milp_forecast": reference[set_name]["pct_of_perfect"]}
+    `reference`: {"twap": ..., "lp_forecast": ...}."""
+    out = {REFERENCE_NAME: reference[set_name]["pct_of_perfect"]}
     for name, entry in reference.get("other_baselines", {}).items():
         if set_name in entry:
             out[name] = entry[set_name]["pct_of_perfect"]

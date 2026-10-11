@@ -288,7 +288,7 @@ def run_status(run_id: str) -> dict:
 
 
 def _other_baselines(reference: dict | None) -> list[dict]:
-    """The baselines besides milp_forecast (static bids), from the run's own
+    """The baselines besides the reference policy (e.g. the LP planner), from the run's own
     reference copy, or, for runs started before they existed, from the current
     cache when the run was scored under the current config."""
     others = (reference or {}).get("other_baselines")

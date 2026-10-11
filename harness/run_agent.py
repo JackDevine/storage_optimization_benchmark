@@ -72,7 +72,7 @@ from claude_agent_sdk import (
 
 from bess.config import load_config
 from harness.evaluator import (
-    FULL_MONTH_TIMEOUT_FACTOR, baseline_pcts, config_fingerprint, evaluate, load_reference, update_reference,
+    FULL_MONTH_TIMEOUT_FACTOR, REFERENCE_NAME, baseline_pcts, config_fingerprint, evaluate, load_reference, update_reference,
 )
 from harness.sandbox import PROJECT_ROOT, write_agent_cli_wrapper
 from harness.splits import DEV_EPISODES, HOLDOUT_EPISODES, HOLDOUT_MONTHS
@@ -253,6 +253,7 @@ class Run:
             n_episodes=len(HOLDOUT_EPISODES),
             n_dev_episodes=len(DEV_EPISODES),
             ramp_rate=self.config.battery.ramp_rate_mw_per_min,
+            degradation_cost=self.config.battery.degradation_cost,
         )
         (self.workspace / "TASK.md").write_text(task)
         self.submissions_dir.mkdir()
@@ -414,8 +415,8 @@ class Run:
                 lines += [f"  example rejection: {x}" for x in sorted(reasons)[:2]]
         else:
             lines.append(f"FAILED: {result['error'][:1000]}")
-        lines.append(f"Baseline (milp_forecast) on the same holdout episodes: {baseline:.1f}% of perfect foresight.")
-        others = {k: v for k, v in baseline_pcts(self.reference, "holdout_episodes").items() if k != "milp_forecast"}
+        lines.append(f"Baseline (TWAP) on the same holdout episodes: {baseline:.1f}% of perfect foresight.")
+        others = {k: v for k, v in baseline_pcts(self.reference, "holdout_episodes").items() if k != REFERENCE_NAME}
         if others:
             lines.append("Other baselines on the same episodes: "
                          + ", ".join(f"{k} {v:.1f}%" for k, v in others.items()) + ".")
