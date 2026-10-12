@@ -78,9 +78,9 @@ TABLES |= {
 }
 # name -> SQL row filter, for tables much bigger than a policy needs
 FILTERS = {
-    # the LOR assessment only (the outage runs repeat it), and only the next 3 days
+    # one assessment (the outage run: the LOR run only exists from 2023), and only the next 3 days
     # (on the raw text columns, before casting)
-    "stpasa_regionsolution": "\"RUNTYPE\" = 'LOR' AND strptime(\"INTERVAL_DATETIME\", '%Y/%m/%d %H:%M:%S') "
+    "stpasa_regionsolution": "\"RUNTYPE\" = 'OUTAGE_LRC' AND strptime(\"INTERVAL_DATETIME\", '%Y/%m/%d %H:%M:%S') "
                              "<= strptime(\"RUN_DATETIME\", '%Y/%m/%d %H:%M:%S') + INTERVAL 3 DAY",
 }
 
