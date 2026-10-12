@@ -68,6 +68,11 @@ def build(dest: Path = DB_PATH, raw: Path = RAW_DB) -> None:
             t0 = time.time()
             # The cap in force: the last effective date at or before `when`
             # (an ASOF join), then g(p) from bess/normalise.py in SQL.
+            # TODO(cap fix, next rebuild): forecasts are mapped with the cap at their run
+            # time, but their prices are set under the cap of the period they forecast.
+            # Runs on 30 June 2024 forecast July periods under the new $17,500 cap and were
+            # stretched by the old $16,600 one: 119 predispatch rows map above $23,200 (up to
+            # $24,042). Map forecasts with the cap in force at the forecast period instead.
             mapped = (
                 f"CASE WHEN t.RRP > {k} AND c.VOLL <> {m_now} THEN "
                 f"{k} + ({m_now} - {k}) * pow(greatest((t.RRP - {k}) / (c.VOLL - {k}), 0), {gamma}) "
