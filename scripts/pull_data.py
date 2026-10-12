@@ -10,6 +10,8 @@ prices were settled on 30-minute averages.
 
 Usage:
     uv run scripts/pull_data.py [--start 2021-10] [--end 2026-08] [--tables dispatchprice ...]
+
+Tables in RAW_ONLY (candidate forecast features) are only downloaded.
 """
 
 import argparse
@@ -48,6 +50,17 @@ TABLES = {
     }),
 }
 DEDUP_KEYS = {"market_price_thresholds": ["EFFECTIVEDATE", "VERSIONNO"]}
+
+# Candidate forecast-feature tables, downloaded to the raw cache only (their
+# columns are chosen once a file has been inspected): name -> (archive
+# directory, AEMO table). All runs, so each can be read as known at a time.
+RAW_ONLY = {
+    "dispatchregionsum": ("DATA", "DISPATCHREGIONSUM"),
+    "predispatchregionsum": ("PREDISP_ALL_DATA", "PREDISPATCHREGIONSUM"),
+    "stpasa_regionsolution": ("DATA", "STPASA_REGIONSOLUTION"),
+    # archived from August 2024 only
+    "p5min_pricesensitivities": ("DATA", "P5MIN_PRICESENSITIVITIES"),
+}
 
 
 def _create(con: duckdb.DuckDBPyConnection, name: str, columns: dict[str, str]) -> None:
@@ -97,19 +110,39 @@ def pull(name: str, months: pd.DatetimeIndex, con: duckdb.DuckDBPyConnection) ->
         con.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT DISTINCT ON ({keys}) * FROM {name} ORDER BY {keys}")
 
 
+def fetch(name: str, months: pd.DatetimeIndex) -> None:
+    """Download a RAW_ONLY table's monthly files into the raw cache."""
+    directory, aemo_table = RAW_ONLY[name]
+    for ts in months:
+        month = f"{ts.year}-{ts.month:02d}"
+        files = table_files(ts.year, ts.month, directory, aemo_table)
+        if not files:
+            print(f"{'SKIP' if files is None else 'MISSING'} {name} {month}", flush=True)
+            continue
+        t0 = time.time()
+        size = sum(download(ts.year, ts.month, directory, f, RAW_CACHE_DIR).stat().st_size for f in files)
+        print(f"OK   {name} {month}: {size / 1e6:,.0f} MB, {time.time() - t0:.0f}s", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", default="2021-10")
     parser.add_argument("--end", default=None, help="last month (default: the latest published)")
-    parser.add_argument("--tables", nargs="+", default=list(TABLES), choices=list(TABLES))
+    parser.add_argument("--tables", nargs="+", default=list(TABLES), choices=list(TABLES) + list(RAW_ONLY))
     args = parser.parse_args()
 
     end = pd.Timestamp(args.end) if args.end else pd.Timestamp.now().normalize().replace(day=1)
     months = pd.date_range(pd.Timestamp(args.start), end, freq="MS")
+    for name in args.tables:
+        if name in RAW_ONLY:
+            fetch(name, months)
+    loaded = [name for name in args.tables if name in TABLES]
+    if not loaded:
+        return
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(DB_PATH))
     try:
-        for name in args.tables:
+        for name in loaded:
             pull(name, months, con)
     finally:
         con.close()
