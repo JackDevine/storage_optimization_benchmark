@@ -78,9 +78,12 @@ def download(year: int, month: int, directory: str, name: str, cache_dir: Path) 
     return path
 
 
-def read_zip(con: duckdb.DuckDBPyConnection, zip_path: Path, columns: dict[str, str]) -> duckdb.DuckDBPyRelation:
+def read_zip(con: duckdb.DuckDBPyConnection, zip_path: Path, columns: dict[str, str],
+             filter: str | None = None) -> duckdb.DuckDBPyRelation:
     """Read the data rows of an MMSDM CSV zip into a DuckDB relation with the
     given {column: SQL type} (timestamps parse AEMO's `YYYY/MM/DD HH:MM:SS`).
+    Columns a file doesn't have (older table versions) come back NULL. `filter`
+    is an SQL condition on the raw text columns, applied before casting.
 
     An MMSDM CSV is a `C` metadata row, an `I` header row, `D` data rows and a
     `C,END OF REPORT` footer. The relation is materialised before the CSV is
@@ -97,11 +100,15 @@ def read_zip(con: duckdb.DuckDBPyConnection, zip_path: Path, columns: dict[str, 
         raw = con.read_csv(str(csv), header=True, all_varchar=True, null_padding=True, sep=",", quotechar='"')
         con.register("_mmsdm_raw", raw)
         first = raw.columns[0]
+        present = set(raw.columns)
         select = ", ".join(
-            f"try_strptime(\"{c}\", '%Y/%m/%d %H:%M:%S') AS {c}" if t == "TIMESTAMP" else f"TRY_CAST(\"{c}\" AS {t}) AS {c}"
+            f"NULL::{t} AS {c}" if c not in present
+            else f"try_strptime(\"{c}\", '%Y/%m/%d %H:%M:%S') AS {c}" if t == "TIMESTAMP"
+            else f"TRY_CAST(\"{c}\" AS {t}) AS {c}"
             for c, t in columns.items()
         )
         name = f"_mmsdm_{abs(hash(str(zip_path)))}"
-        con.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT {select} FROM _mmsdm_raw WHERE \"{first}\" = 'D'")
+        con.execute(f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT {select} FROM _mmsdm_raw WHERE \"{first}\" = 'D'"
+                    + (f" AND ({filter})" if filter else ""))
         con.unregister("_mmsdm_raw")
     return con.table(name)

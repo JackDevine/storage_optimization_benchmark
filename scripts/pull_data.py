@@ -10,8 +10,6 @@ prices were settled on 30-minute averages.
 
 Usage:
     uv run scripts/pull_data.py [--start 2021-10] [--end 2026-08] [--tables dispatchprice ...]
-
-Tables in RAW_ONLY (candidate forecast features) are only downloaded.
 """
 
 import argparse
@@ -51,15 +49,39 @@ TABLES = {
 }
 DEDUP_KEYS = {"market_price_thresholds": ["EFFECTIVEDATE", "VERSIONNO"]}
 
-# Candidate forecast-feature tables, downloaded to the raw cache only (their
-# columns are chosen once a file has been inspected): name -> (archive
-# directory, AEMO table). All runs, so each can be read as known at a time.
-RAW_ONLY = {
-    "dispatchregionsum": ("DATA", "DISPATCHREGIONSUM"),
-    "predispatchregionsum": ("PREDISP_ALL_DATA", "PREDISPATCHREGIONSUM"),
-    "stpasa_regionsolution": ("DATA", "STPASA_REGIONSOLUTION"),
+# Candidate forecast features (all runs, so each can be read as known at a
+# time). Optional row filters keep the big tables to what a policy could use.
+SENS = {f"RRP{i}": DBL for i in range(1, 44)}
+TABLES |= {
+    "dispatchregionsum": ("DATA", "DISPATCHREGIONSUM", {
+        "SETTLEMENTDATE": TS, "REGIONID": STR, "INTERVENTION": INT, "TOTALDEMAND": DBL, "AVAILABLEGENERATION": DBL,
+        "NETINTERCHANGE": DBL, "SS_SOLAR_UIGF": DBL, "SS_WIND_UIGF": DBL,
+    }),
+    # demand and availability columns of the P5MIN files the prices come from
+    "p5min_regionsum": ("P5MIN_ALL_DATA", "P5MIN_REGIONSOLUTION", {
+        "RUN_DATETIME": TS, "INTERVAL_DATETIME": TS, "REGIONID": STR, "INTERVENTION": INT, "TOTALDEMAND": DBL,
+        "AVAILABLEGENERATION": DBL, "NETINTERCHANGE": DBL, "SS_SOLAR_UIGF": DBL, "SS_WIND_UIGF": DBL,
+    }),
+    "predispatchregionsum": ("PREDISP_ALL_DATA", "PREDISPATCHREGIONSUM", {
+        "PREDISPATCHSEQNO": STR, "LASTCHANGED": TS, "DATETIME": TS, "REGIONID": STR, "INTERVENTION": INT,
+        "TOTALDEMAND": DBL, "AVAILABLEGENERATION": DBL, "NETINTERCHANGE": DBL, "SS_SOLAR_UIGF": DBL, "SS_WIND_UIGF": DBL,
+    }),
+    "stpasa_regionsolution": ("DATA", "STPASA_REGIONSOLUTION", {
+        "RUN_DATETIME": TS, "INTERVAL_DATETIME": TS, "REGIONID": STR, "LASTCHANGED": TS, "DEMAND10": DBL,
+        "DEMAND50": DBL, "DEMAND90": DBL, "SURPLUSRESERVE": DBL, "LORCONDITION": INT,
+        "AGGREGATECAPACITYAVAILABLE": DBL, "UIGF": DBL,
+    }),
     # archived from August 2024 only
-    "p5min_pricesensitivities": ("DATA", "P5MIN_PRICESENSITIVITIES"),
+    "p5min_pricesensitivities": ("DATA", "P5MIN_PRICESENSITIVITIES", {
+        "RUN_DATETIME": TS, "INTERVAL_DATETIME": TS, "REGIONID": STR, "INTERVENTION": INT, **SENS,
+    }),
+}
+# name -> SQL row filter, for tables much bigger than a policy needs
+FILTERS = {
+    # the LOR assessment only (the outage runs repeat it), and only the next 3 days
+    # (on the raw text columns, before casting)
+    "stpasa_regionsolution": "\"RUNTYPE\" = 'LOR' AND strptime(\"INTERVAL_DATETIME\", '%Y/%m/%d %H:%M:%S') "
+                             "<= strptime(\"RUN_DATETIME\", '%Y/%m/%d %H:%M:%S') + INTERVAL 3 DAY",
 }
 
 
@@ -98,7 +120,8 @@ def pull(name: str, months: pd.DatetimeIndex, con: duckdb.DuckDBPyConnection) ->
         t0, rows = time.time(), 0
         con.execute("BEGIN")
         for f in files:
-            rel = read_zip(con, download(ts.year, ts.month, directory, f, RAW_CACHE_DIR), columns)
+            rel = read_zip(con, download(ts.year, ts.month, directory, f, RAW_CACHE_DIR), columns,
+                           filter=FILTERS.get(name))
             con.execute(f"INSERT INTO {name} SELECT * FROM {rel.alias}")
             rows += rel.shape[0]
             con.execute(f"DROP TABLE {rel.alias}")
@@ -110,39 +133,19 @@ def pull(name: str, months: pd.DatetimeIndex, con: duckdb.DuckDBPyConnection) ->
         con.execute(f"CREATE OR REPLACE TABLE {name} AS SELECT DISTINCT ON ({keys}) * FROM {name} ORDER BY {keys}")
 
 
-def fetch(name: str, months: pd.DatetimeIndex) -> None:
-    """Download a RAW_ONLY table's monthly files into the raw cache."""
-    directory, aemo_table = RAW_ONLY[name]
-    for ts in months:
-        month = f"{ts.year}-{ts.month:02d}"
-        files = table_files(ts.year, ts.month, directory, aemo_table)
-        if not files:
-            print(f"{'SKIP' if files is None else 'MISSING'} {name} {month}", flush=True)
-            continue
-        t0 = time.time()
-        size = sum(download(ts.year, ts.month, directory, f, RAW_CACHE_DIR).stat().st_size for f in files)
-        print(f"OK   {name} {month}: {size / 1e6:,.0f} MB, {time.time() - t0:.0f}s", flush=True)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", default="2021-10")
     parser.add_argument("--end", default=None, help="last month (default: the latest published)")
-    parser.add_argument("--tables", nargs="+", default=list(TABLES), choices=list(TABLES) + list(RAW_ONLY))
+    parser.add_argument("--tables", nargs="+", default=list(TABLES), choices=list(TABLES))
     args = parser.parse_args()
 
     end = pd.Timestamp(args.end) if args.end else pd.Timestamp.now().normalize().replace(day=1)
     months = pd.date_range(pd.Timestamp(args.start), end, freq="MS")
-    for name in args.tables:
-        if name in RAW_ONLY:
-            fetch(name, months)
-    loaded = [name for name in args.tables if name in TABLES]
-    if not loaded:
-        return
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(DB_PATH))
     try:
-        for name in loaded:
+        for name in args.tables:
             pull(name, months, con)
     finally:
         con.close()
