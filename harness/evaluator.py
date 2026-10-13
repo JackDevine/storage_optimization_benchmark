@@ -161,7 +161,8 @@ def evaluate(
     }
 
 
-JOB_MEMORY_GB = 0.6  # a scoring job (about 0.3 GB) and a Python policy process (about 0.2 GB)
+JOB_MEMORY_GB = 1.0  # a scoring job (about 0.6 GB with TWAP and perfect foresight in it) and a Python policy process
+SPARE_MEMORY_GB = 4.0  # left free: several evaluations (runs side by side) each size themselves when they start
 
 
 def job_memory_gb(policy_dir: Path) -> float:
@@ -170,13 +171,13 @@ def job_memory_gb(policy_dir: Path) -> float:
 
 
 def _memory_workers(per_job_gb: float = JOB_MEMORY_GB) -> int:
-    """How many scoring jobs fit in the memory available now, keeping 2 GB spare."""
+    """How many scoring jobs fit in the memory available now, keeping SPARE_MEMORY_GB spare."""
     try:
         with open("/proc/meminfo") as f:
             avail_kb = next(int(line.split()[1]) for line in f if line.startswith("MemAvailable:"))
     except (OSError, StopIteration):
         return 1_000
-    return max(2, int((avail_kb / 1e6 - 2) / per_job_gb))
+    return max(2, int((avail_kb / 1e6 - SPARE_MEMORY_GB) / per_job_gb))
 
 
 def score(value: float, shortfall: float, perfect: float, lam: float = SHORTFALL_LAMBDA) -> float | None:
