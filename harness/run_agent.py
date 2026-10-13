@@ -72,10 +72,10 @@ from claude_agent_sdk import (
 
 from bess.config import load_config
 from harness.evaluator import (
-    FULL_MONTH_TIMEOUT_FACTOR, REFERENCE_NAME, baseline_pcts, config_fingerprint, evaluate, load_reference, update_reference,
+    FULL_MONTH_TIMEOUT_FACTOR, REFERENCE_NAME, SHORTFALL_LAMBDA, baseline_pcts, config_fingerprint, evaluate, load_reference, update_reference,
 )
 from harness.sandbox import PROJECT_ROOT, write_agent_cli_wrapper
-from harness.splits import DEV_EPISODES, HOLDOUT_EPISODES, HOLDOUT_MONTHS
+from harness.splits import DEV_EPISODES, DEV_MONTHS, HOLDOUT_EPISODES, HOLDOUT_MONTHS
 
 RUNS_DIR = PROJECT_ROOT / "runs"
 TOKEN_FILE = Path.home() / ".config" / "storage-benchmark" / "claude_oauth_token"
@@ -254,6 +254,9 @@ class Run:
             n_dev_episodes=len(DEV_EPISODES),
             ramp_rate=self.config.battery.ramp_rate_mw_per_min,
             degradation_cost=self.config.battery.degradation_cost,
+            shortfall_lambda=SHORTFALL_LAMBDA,
+            shortfall_cost=1 + SHORTFALL_LAMBDA,
+            n_dev_months=len(DEV_MONTHS),
         )
         (self.workspace / "TASK.md").write_text(task)
         self.submissions_dir.mkdir()
@@ -400,8 +403,10 @@ class Run:
         lines = [f"Submission {record['n']} of {self.args.max_submissions} (holdout episodes, all regions):"]
         if "pct_of_perfect" in result:
             lines.append(
-                f"net revenue ${result['net_revenue']:,.0f} = {result['pct_of_perfect']:.1f}% of perfect foresight; "
-                f"valid: {result['valid']}"
+                f"score {result['pct_of_perfect']:.1f}% of perfect foresight; valid: {result['valid']}. "
+                f"Value ${result['value']:,.0f} = net revenue ${result['net_revenue']:,.0f} + stored-energy value "
+                f"change ${result['terminal_credit']:+,.0f}; shortfall against the baseline ${result['shortfall']:,.0f} "
+                f"(score with no shortfall penalty: {result['score_by_lambda']['0']:.1f}%)."
             )
             if not result["valid"]:
                 lines.append(
@@ -415,7 +420,7 @@ class Run:
                 lines += [f"  example rejection: {x}" for x in sorted(reasons)[:2]]
         else:
             lines.append(f"FAILED: {result['error'][:1000]}")
-        lines.append(f"Baseline (TWAP) on the same holdout episodes: {baseline:.1f}% of perfect foresight.")
+        lines.append(f"Baseline (TWAP) on the same holdout episodes: {baseline:.1f}%.")
         others = {k: v for k, v in baseline_pcts(self.reference, "holdout_episodes").items() if k != REFERENCE_NAME}
         if others:
             lines.append("Other baselines on the same episodes: "
@@ -964,7 +969,7 @@ if __name__ == "__main__":
                         help="USD: API-equivalent for Claude runs, real OpenRouter spend for OpenRouter runs")
     parser.add_argument("--max-submissions", type=int, default=5)
     parser.add_argument("--ramp-rate", type=float, help="the battery's ramp rate in MW/min (default: from the config)")
-    parser.add_argument("--eval-timeout", type=float, default=900,
+    parser.add_argument("--eval-timeout", type=float, default=2100,
                         help="seconds per (region, episode) job when scoring a submission")
     parser.add_argument("--max-nudges", type=int, default=5, help="times to prompt the agent to continue")
     parser.add_argument("--max-pause-hours", type=float, default=12.0,

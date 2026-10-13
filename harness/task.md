@@ -2,14 +2,30 @@
 
 Write a Python policy that operates a battery in Australia's National Electricity Market (NEM). Every 5 minutes it
 receives the latest market price forecasts and the battery's state, and returns an energy bid for the next 5-minute
-interval. Your goal is to **maximise net revenue on a holdout period you can't see**: the twelve months that follow
-your development data (September 2025 to August 2026), in all five NEM regions (NSW1, QLD1, SA1, TAS1, VIC1).
+interval. Your goal is to **maximise its score on holdout months you can't see**: twelve calendar months spread
+through January 2023 to August 2026 (one January, one February, and so on, three in each year), which are missing
+from your development data, in all five NEM regions (NSW1, QLD1, SA1, TAS1, VIC1). The score rewards net revenue and
+penalises days on which you do worse than a simple baseline (see **Scoring**).
 
-Submissions are scored on a fixed, undisclosed sample of **{n_episodes} three-day episodes** from the holdout, one
-per calendar month, in every region. Each episode starts at a trading-day boundary (04:00) with the battery at 50%.
-After the run ends, your final submission is also scored on the **whole holdout**, one calendar month at a time
-(each month starting the battery at 50%), and that is the reported result. Don't tune for 3-day horizons
-specifically.
+Submissions are scored on a fixed, undisclosed sample of **{n_episodes} episodes** of several days each, one in each
+holdout month, in every region. Each episode starts at a trading-day boundary (04:00) with the battery at 50%. After
+the run ends, your final submission is also scored on the **whole holdout**, one calendar month at a time (each month
+starting the battery at 50%), and that is the reported result.
+
+## Scoring
+
+For each region and scoring window (an episode or a month):
+- **Value** = net revenue (revenue less degradation) + the change in the value of the energy stored in the battery
+  over the window. Energy left at the end is valued by a fixed dynamic program over the forecast known at the window's
+  end, the same for every policy (`bess.terminal`), so there's no point emptying the battery before an end you can't
+  see, and holding energy that's worth something tomorrow isn't penalised.
+- **Shortfall:** the baseline (TWAP, below) runs on the same window. On each trading day where your value is below
+  its value, the difference is your shortfall for that day (the stored-energy change counts on the window's last day).
+- **Score** = (total value − {shortfall_lambda:g} × total shortfall) as a percentage of perfect foresight's value over
+  the same windows, summed over all regions and windows. Perfect foresight plans with the same end-of-window value.
+
+So every $1 you fall behind the baseline on a day costs you ${shortfall_cost:.2f} in total: the score is a risk-averse
+one, as an operator that's judged against a simple strategy would see it. Days you beat the baseline aren't capped.
 
 ## The battery and the market
 
@@ -91,35 +107,34 @@ One `Policy` instance is created per region and called once per interval, in tim
   It covers about 1 hour in 5-minute steps, and its first interval ending after `tau` is the one you're bidding for.
 - `predispatch`: the latest 30-minute pre-dispatch run, covering 30-minute periods out to the end of the next trading
   day.
-- `history_end`, `history_rrp`: actual prices for every interval that has already ended, from October 2021. In the
-  holdout this includes the whole development period.
+- `history_end`, `history_rrp`: actual prices for every interval that has already ended (in dev, those in the dev
+  data; when scored, the full record up to `tau`).
 
 These forecasts are AEMO's own. They are often wrong, especially around price spikes. AEMO's archive also has
-occasional gaps, so the latest run can be stale: e.g. there are no P5MIN runs from 13:25 to 14:30 on 5 September 2024.
+occasional gaps, so the latest run can be stale.
 
 ## Data and tools
 
-- `data/dev.duckdb`: development data, from 1 October 2021 04:05 (the start of 5-minute settlement) to 1 September
-  2025 00:00. Tables:
+- `data/dev.duckdb`: development data, January 2023 to August 2026, **less the twelve holdout months and three days
+  either side of each** (their prices and the forecast runs published in them are left out). Tables:
   - `dispatchprice` (actual RRP; `APCFLAG` = 1 marks administered pricing, `RRP_RAW` is explained below)
   - `p5min_regionsolution` (P5MIN runs)
   - `predispatchprice` (predispatch runs)
   - `market_price_thresholds` (AEMO's history of the market price cap, `VOLL`, and floor)
   Load a region with `bess.data.load_region(region, Path("data/dev.duckdb"))`, or pass `start`/`end` to load only
   the forecast runs for one window, which is much faster.
-- **Prices are mapped onto today's cap.** The market price cap has risen every July, from $15,100/MWh in 2021 to
+- **Prices are mapped onto today's cap.** The market price cap has risen every July, from $15,500/MWh in 2022–23 to
   $23,200 now. Every price in the data (actual and forecast, dev and holdout) from a period with a lower cap has
   been mapped onto $23,200: prices up to $1,000/MWh are unchanged, and above that they're stretched linearly so the
   period's cap lands on $23,200 (`bess.normalise`). `dispatchprice.RRP_RAW` is the original price.
-- Two periods are excluded from scoring and from the episodes: the June 2022 market suspension (trading days 12–23
-  June 2022), and October 2022, for which AEMO's archive has no predispatch runs (`predispatchprice` has none then).
-- `python -m harness.dev_eval` scores `policy.py` on the dev data. It prints net revenue and % of perfect foresight per
-  region, and writes per-interval results to `dev_results/`.
-  - By default it scores a sample of {n_dev_episodes} three-day dev episodes, chosen the same way as the holdout
-    episodes, in parallel. The baseline scores **{baseline_dev_episodes_pct:.1f}%** on them.
+- `python -m harness.dev_eval` scores `policy.py` on the dev data the way the holdout is scored. It prints each
+  region's score and its parts (net revenue, stored-energy value change, shortfall), and writes per-interval results
+  to `dev_results/`.
+  - By default it scores a sample of {n_dev_episodes} dev episodes, chosen like the holdout episodes, in parallel. The
+    baseline scores **{baseline_dev_episodes_pct:.1f}%** on them.
   - `--start ... --end ...` scores one continuous window instead. Use short windows to iterate quickly.
-  - `--full` scores every dev month (each from 50%). That's 48 months × 5 regions, so it's slow: hours for an
-    MILP-per-interval policy.
+  - `--full` scores every dev month (each from 50%). That's {n_dev_months} months × 5 regions, so it's slow: hours
+    for an MILP-per-interval policy.
   - `--regions` limits any of these to some regions.
 - The `bess` package is read-only source you can import and read. `python -c "import bess; print(bess.__path__)"`
   prints its location, and `harness/` sits beside it. It contains:
@@ -135,14 +150,13 @@ occasional gaps, so the latest run can be stale: e.g. there are no P5MIN runs fr
 - Python libraries: numpy, pandas, duckdb, highspy, pyarrow. There is no network access, so you can't install
   anything else.
 - The `submit_policy` tool scores the current workspace on the **holdout episodes** and tells you:
-  - total net revenue
-  - % of perfect foresight across all regions
+  - the score across all regions, and its parts (value, net revenue, shortfall)
   - whether the run was valid
-  - the baselines' holdout scores, for comparison
+  - the baselines' scores on the same episodes, for comparison
 
   You have **{max_submissions} submissions**. Your final score is your **last valid submission**, so don't submit
-  something worse last. A submission takes a few minutes. Episodes run in parallel, and **each three-day episode
-  must finish within {eval_timeout_min} minutes** or the submission is invalid. That allows about 1 second per
+  something worse last. A submission takes several minutes. Episodes run in parallel, and **each episode must
+  finish within {eval_timeout_min} minutes** or the submission is invalid. That allows about 1 second per
   interval.
 - The `status` tool shows your remaining time, budget and submissions.
 - The `finish` tool ends the run. Call it when you're done.
@@ -154,4 +168,4 @@ You have **{max_hours} hours** of working time and **${max_cost_usd}** of model 
 run stops and your last valid submission stands. Develop and test against the dev data, submit when an idea is ready,
 and use the feedback to decide what to try next.
 
-The baseline scores **{baseline_dev_pct:.1f}%** of perfect foresight over every dev month.
+The baseline scores **{baseline_dev_pct:.1f}%** over every dev month.

@@ -32,7 +32,8 @@ RAW_DB = PROJECT_ROOT / "data" / "benchmark.duckdb"
 DEV_DB = PROJECT_ROOT / "data" / "dev.duckdb"
 INTERVAL_SQL = "INTERVAL 5 MINUTE"
 
-# table -> (columns kept, the time that picks the cap, sort order)
+# table -> (columns kept, the time that picks the cap, sort order). A forecast
+# price is mapped with the cap of the interval it forecasts, not of its run.
 TABLES = {
     "dispatchprice": (
         "SETTLEMENTDATE, REGIONID, INTERVENTION, RRP, APCFLAG, MARKETSUSPENDEDFLAG",
@@ -41,12 +42,12 @@ TABLES = {
     ),
     "p5min_regionsolution": (
         "RUN_DATETIME, INTERVAL_DATETIME, REGIONID, INTERVENTION, RRP",
-        f"RUN_DATETIME - {INTERVAL_SQL}",  # when the run was made
+        f"INTERVAL_DATETIME - {INTERVAL_SQL}",  # the forecast interval's start: its price is set under that cap
         "REGIONID, RUN_DATETIME, INTERVAL_DATETIME",
     ),
     "predispatchprice": (
         "LASTCHANGED, DATETIME, REGIONID, INTERVENTION, RRP",
-        "LASTCHANGED",
+        "DATETIME - INTERVAL 30 MINUTE",  # the forecast period's start
         "REGIONID, LASTCHANGED, DATETIME",
     ),
 }
@@ -68,11 +69,6 @@ def build(dest: Path = DB_PATH, raw: Path = RAW_DB) -> None:
             t0 = time.time()
             # The cap in force: the last effective date at or before `when`
             # (an ASOF join), then g(p) from bess/normalise.py in SQL.
-            # TODO(cap fix, next rebuild): forecasts are mapped with the cap at their run
-            # time, but their prices are set under the cap of the period they forecast.
-            # Runs on 30 June 2024 forecast July periods under the new $17,500 cap and were
-            # stretched by the old $16,600 one: 119 predispatch rows map above $23,200 (up to
-            # $24,042). Map forecasts with the cap in force at the forecast period instead.
             mapped = (
                 f"CASE WHEN t.RRP > {k} AND c.VOLL <> {m_now} THEN "
                 f"{k} + ({m_now} - {k}) * pow(greatest((t.RRP - {k}) / (c.VOLL - {k}), 0), {gamma}) "

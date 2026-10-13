@@ -1,14 +1,15 @@
 """Score a policy on the development data (run this from the agent workspace).
 
-    python -m harness.dev_eval [--regions SA1 VIC1]                  # sampled 3-day dev episodes
-    python -m harness.dev_eval --start 2025-07-01 --end 2025-07-08   # one window
+    python -m harness.dev_eval [--regions SA1 VIC1]                  # sampled dev episodes
+    python -m harness.dev_eval --start 2025-08-01 --end 2025-08-08   # one window
     python -m harness.dev_eval --full                                # every dev month
 
-Uses ./data/dev.duckdb (October 2021 to August 2025). By default it scores on
-sampled 3-day dev episodes (chosen like the holdout episodes) in parallel;
+Uses ./data/dev.duckdb (January 2023 to August 2026, less the holdout months
+and a few days either side of each). By default it scores on six sampled dev
+episodes of several days each (chosen like the holdout episodes) in parallel;
 --start/--end give one continuous window instead, and --full every dev month,
-each a separate window. Prints each region's net revenue and % of perfect
-foresight, and the total. Per-interval results (bids rejected, MW, prices,
+each a separate window. Prints each region's score (as the holdout is scored)
+with its parts, and the total. Per-interval results (bids rejected, MW, prices,
 revenue) are written to ./dev_results/<region>_ep<k>_intervals.parquet, and
 anything the policy prints goes to ./dev_results/<region>_ep<k>_stderr.log.
 """
@@ -46,7 +47,7 @@ if __name__ == "__main__":
         if start < DEV_START or end > DEV_END or start >= end:
             parser.error(f"window must lie within ({DEV_START}, {DEV_END}]")
         if excluded_overlap(start, end):
-            parser.error(f"window overlaps an excluded period (market suspension): {EXCLUDED}")
+            parser.error(f"window overlaps a holdout month or its buffer (not in the dev data): {EXCLUDED}")
     windows = [(start, end)] if window else DEV_MONTHS if args.full else DEV_EPISODES
     episodes = not window
 
@@ -65,7 +66,8 @@ if __name__ == "__main__":
                 f"{r.get('bid_nonconformance_intervals', 0)} wrong-ramp-rate bids)"
             )
             print(
-                f"{label}: net ${r['net_revenue']:,.0f} = {r['pct_of_perfect']:.1f}% of perfect foresight, "
+                f"{label}: score {r['pct_of_perfect']:.1f}% (net ${r['net_revenue']:,.0f}, stored-energy value "
+                f"change ${r['terminal_credit']:+,.0f}, shortfall vs TWAP ${r['shortfall']:,.0f}), "
                 f"{r['equivalent_cycles']:.0f} cycles, {r['policy_seconds']:.0f}s{flag}"
             )
             if r["first_rejection"]:
@@ -73,7 +75,11 @@ if __name__ == "__main__":
             if r.get("first_bid_nonconformance"):
                 print(f"    first wrong-ramp-rate bid: {r['first_bid_nonconformance'][0][:500]}")
     if "pct_of_perfect" in result:
-        print(f"TOTAL: net ${result['net_revenue']:,.0f} = {result['pct_of_perfect']:.1f}% of perfect foresight, valid={result['valid']}")
+        lam = result["score_by_lambda"]
+        print(f"TOTAL: score {result['pct_of_perfect']:.1f}% of perfect foresight, valid={result['valid']} "
+              f"(value ${result['value']:,.0f} = net ${result['net_revenue']:,.0f} + stored-energy value change "
+              f"${result['terminal_credit']:+,.0f}; shortfall vs TWAP ${result['shortfall']:,.0f}; "
+              f"with no shortfall penalty {lam['0']:.1f}%)")
     else:
         print(f"TOTAL: failed: {result['error']}")
     print(f"({result['eval_seconds']:.0f}s)")

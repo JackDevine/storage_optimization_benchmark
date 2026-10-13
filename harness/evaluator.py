@@ -7,10 +7,18 @@ wall-clock timeout, which drives the policy through RemotePolicy. Jobs run in
 parallel. For holdout evaluation the policy process is additionally sandboxed
 (harness/sandbox.py).
 
-Submissions are scored on short sampled episodes (harness/splits.py) so they
-take about one episode's simulated time. The score is the total net revenue
-across all jobs as a percentage of perfect foresight's total over the same
-windows; each window starts from the battery's initial SOC.
+Submissions are scored on sampled 7-day episodes (harness/splits.py) so they
+take about one episode's simulated time. Each window starts from the battery's
+initial SOC. In every job:
+- value = net revenue + the change in the stored energy's value over the
+  window, V(e_end) - V(e_start) (bess/terminal.py; the same V for everyone);
+- the TWAP baseline runs on the same window, and each trading day the policy
+  falls behind it (value per day; the energy-value change counts on the last
+  day) adds to its shortfall;
+- perfect foresight plans with the same terminal value.
+The score is (sum of value - SHORTFALL_LAMBDA x sum of shortfall) as a
+percentage of perfect foresight's value, pooled over all jobs. Scores at
+LAMBDAS and with equal weight per window are reported alongside.
 
     uv run python -m harness.evaluator reference   # cache baseline scores (all baselines)
 """
@@ -31,7 +39,8 @@ import pandas as pd
 
 from bess.config import Config, load_config
 from bess.data import DB_PATH, load_region
-from bess.policies import PerfectForesight
+from bess.policies import PerfectForesight, TWAPPolicy
+from bess.terminal import credit, end_value
 from bess.remote import RemotePolicy, RemotePolicyError, config_from_dict, config_to_dict
 from bess.sim import simulate, summarise
 from harness.sandbox import PROJECT_ROOT, policy_sandbox
@@ -50,7 +59,10 @@ REFERENCE_PATH = PROJECT_ROOT / "data" / "reference_scores.json"  # legacy: one 
 # Bump when the simulator's scoring rules change, so baselines get recomputed.
 # 3: built-in policies and perfect foresight conform their bids (bess.bid.conform); TWAP headline baseline.
 # 2: straight-line dispatch trajectory and the unit's ramp rate (1: flat MW, bid's own ramp rates; removed).
-SIM_VERSION = 3
+# 4: value includes the stored energy's change in value; score penalises daily shortfall against TWAP.
+SIM_VERSION = 4
+SHORTFALL_LAMBDA = 0.5  # the headline score's (and the agent's) penalty per $ of shortfall
+LAMBDAS = (0.0, 0.5, 1.0)  # scores reported alongside
 
 
 def config_fingerprint(config: Config) -> str:
@@ -165,6 +177,10 @@ def _memory_workers(per_job_gb: float = JOB_MEMORY_GB) -> int:
     return max(2, int((avail_kb / 1e6 - 2) / per_job_gb))
 
 
+def score(value: float, shortfall: float, perfect: float, lam: float = SHORTFALL_LAMBDA) -> float | None:
+    return 100 * (value - lam * shortfall) / perfect if perfect else None
+
+
 def aggregate(jobs: list[dict]) -> dict:
     errors = [j for j in jobs if "error" in j]
     if errors:
@@ -176,27 +192,43 @@ def aggregate(jobs: list[dict]) -> dict:
             ),
         }
 
+    def sums(js):
+        return (sum(j["value"] for j in js), sum(j["shortfall"] for j in js), sum(j["perfect_foresight_value"] for j in js))
+
     def pct_by(key) -> dict:
         groups = {}
         for j in jobs:
-            g = groups.setdefault(j[key], [0.0, 0.0])
-            g[0] += j["net_revenue"]
-            g[1] += j["perfect_foresight_net_revenue"]
-        return {k: 100 * net / perfect if perfect else None for k, (net, perfect) in groups.items()}
+            groups.setdefault(j[key], []).append(j)
+        return {k: score(*sums(js)) for k, js in groups.items()}
 
-    net = sum(j["net_revenue"] for j in jobs)
-    perfect = sum(j["perfect_foresight_net_revenue"] for j in jobs)
+    value, shortfall, perfect = sums(jobs)
+    by_window = pct_by("episode")
     return {
         "valid": all(j["valid"] for j in jobs),
-        "net_revenue": net,
-        "perfect_foresight_net_revenue": perfect,
-        "pct_of_perfect": 100 * net / perfect,
+        "pct_of_perfect": score(value, shortfall, perfect),  # the headline score
+        "score_by_lambda": {f"{lam:g}": score(value, shortfall, perfect, lam) for lam in LAMBDAS},
+        "equal_window_pct": sum(by_window.values()) / len(by_window),
+        "net_revenue": sum(j["net_revenue"] for j in jobs),
+        "terminal_credit": sum(j["terminal_credit"] for j in jobs),
+        "value": value,
+        "shortfall": shortfall,
+        "twap_value": sum(j["twap_value"] for j in jobs),
+        "perfect_foresight_net_revenue": sum(j["perfect_foresight_net_revenue"] for j in jobs),
+        "perfect_foresight_value": perfect,
         "rejected_bids": sum(j["rejected_bids"] for j in jobs),
         "nonconformance_intervals": sum(j["nonconformance_intervals"] for j in jobs),
         "bid_nonconformance_intervals": sum(j.get("bid_nonconformance_intervals", 0) for j in jobs),
         "per_region_pct": pct_by("region"),
-        "per_episode_pct": pct_by("episode"),
+        "per_episode_pct": by_window,
     }
+
+
+def daily_value(intervals: pd.DataFrame, terminal_credit: float) -> pd.Series:
+    """Net revenue per trading day (04:00 to 04:00), the energy-value change on the last day."""
+    day = (intervals.interval_end - pd.Timedelta(minutes=5) - pd.Timedelta(hours=4)).dt.floor("D")
+    daily = (intervals.revenue - intervals.degradation_cost).groupby(day).sum()
+    daily.iloc[-1] += terminal_credit
+    return daily
 
 
 def _run_region(args) -> dict:
@@ -237,19 +269,34 @@ def _run_region(args) -> dict:
         # The policy process went away without a word: killed from outside
         # (a crash leaves a traceback). Not the policy's fault, so say so.
         return killed
-    summary = summarise(intervals, config.battery)
-    perfect = summarise(
-        simulate(PerfectForesight(config, data.actual_rrp, start, end), data, config, start, end),
-        config.battery,
-    )
+    b = config.battery
+    terminal = end_value(data, end, b)
+    summary = summarise(intervals, b)
+    agent_credit = credit(terminal, float(intervals.energy_end_mwh.iloc[-1]), b.e_initial)
+    pf_intervals = simulate(PerfectForesight(config, data.actual_rrp, start, end, terminal), data, config, start, end)
+    perfect = summarise(pf_intervals, b)
+    pf_credit = credit(terminal, float(pf_intervals.energy_end_mwh.iloc[-1]), b.e_initial)
+    twap_intervals = simulate(TWAPPolicy(config), data, config, start, end)
+    twap_credit = credit(terminal, float(twap_intervals.energy_end_mwh.iloc[-1]), b.e_initial)
+    agent_daily, twap_daily = daily_value(intervals, agent_credit), daily_value(twap_intervals, twap_credit)
+    shortfall = float((twap_daily - agent_daily.reindex(twap_daily.index, fill_value=0.0)).clip(lower=0).sum())
     if out_dir:
         intervals.to_parquet(out_dir / f"{tag}_intervals.parquet")
+    value = summary["net_revenue"] + agent_credit
+    pf_value = perfect["net_revenue"] + pf_credit
     return {
         "region": args.region,
         "valid": summary["valid"],
         "net_revenue": summary["net_revenue"],
+        "terminal_credit": agent_credit,
+        "value": value,
+        "shortfall": shortfall,
+        "twap_value": float(twap_daily.sum()),
         "perfect_foresight_net_revenue": perfect["net_revenue"],
-        "pct_of_perfect": 100 * summary["net_revenue"] / perfect["net_revenue"],
+        "perfect_foresight_value": pf_value,
+        "pct_of_perfect": score(value, shortfall, pf_value),
+        "daily_value": {str(k.date()): float(v) for k, v in agent_daily.items()},
+        "twap_daily_value": {str(k.date()): float(v) for k, v in twap_daily.items()},
         "rejected_bids": summary["rejected_bids"],
         "nonconformance_intervals": summary["nonconformance_intervals"],
         "nonconformance_mwh": summary["nonconformance_mwh"],
@@ -261,7 +308,7 @@ def _run_region(args) -> dict:
     }
 
 
-FULL_MONTH_TIMEOUT_FACTOR = 31 / 3  # a one-month job (the full holdout runs one job per month) vs a 3-day episode job
+FULL_MONTH_TIMEOUT_FACTOR = 31 / 7  # a one-month job (the full holdout runs one job per month) vs a 7-day episode job
 
 REFERENCE_SETS = {
     "dev": DEV_MONTHS,

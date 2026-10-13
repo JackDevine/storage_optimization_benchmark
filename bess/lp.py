@@ -9,6 +9,9 @@ Variables per step k: charge c_k, discharge d_k (MW), end-of-step energy e_k
          0 <= c_k, d_k,   E_min <= e_k <= E_max
          |(d_k - c_k) - (d_{k-1} - c_{k-1})| <= ramp * step minutes
          e_N + s >= E_target,   s >= 0          (only when penalty > 0)
+    plus V(e_N) for a concave terminal value of stored energy (optional, as
+    piecewise-linear segments: e_N = grid_0 + sum_j z_j, 0 <= z_j <= width_j,
+    each z_j worth its segment's slope)
 
 c~ and d~ are the step's average flows. A 5-minute step follows AEMO's
 straight-line path from the previous step's MW to this step's end-of-interval
@@ -48,12 +51,15 @@ def solve_schedule(
     soc_margin_mwh: float = 0.0,
     time_limit: float | None = None,
     integer: bool = True,
+    terminal_value: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return (charge_mw, discharge_mw, energy_mwh) per step. With `time_limit`
     (seconds), the best solution found by then is returned. `integer=False`
     relaxes the binaries to an LP (about 5x faster; it may then charge and
     discharge in the same step). `p_prev` is the
-    unit's MW now (+ = discharge), where the first step's straight line starts."""
+    unit's MW now (+ = discharge), where the first step's straight line starts.
+    `terminal_value` is (energy grid, value) of the energy left at the end,
+    concave in energy (bess.terminal.concave makes it so)."""
     n = len(prices)
     p, dt, b = np.asarray(prices, float), np.asarray(dt_hours, float), battery
     inf = highspy.kHighsInf
@@ -131,6 +137,22 @@ def solve_schedule(
         col_lower = np.append(col_lower, 0.0)
         col_upper = np.append(col_upper, inf)
         integrality = np.append(integrality, 0)
+
+    if terminal_value is not None:
+        # e_{N-1} - sum_j z_j = grid_0, each z_j in [0, width_j] earning its slope
+        grid, value = (np.asarray(x, float) for x in terminal_value)
+        width, slope = np.diff(grid), np.diff(value) / np.diff(grid)
+        z0, row, m = num_col, len(row_lower), len(width)
+        rows += [np.full(m + 1, row)]
+        cols += [np.concatenate([[E + n - 1], z0 + np.arange(m)])]
+        vals += [np.concatenate([[1.0], -np.ones(m)])]
+        row_lower = np.append(row_lower, grid[0])
+        row_upper = np.append(row_upper, grid[0])
+        cost = np.append(cost, -slope)
+        col_lower = np.append(col_lower, np.zeros(m))
+        col_upper = np.append(col_upper, width)
+        integrality = np.append(integrality, np.zeros(m))
+        num_col += m
 
     rows, cols, vals = np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
     keep = vals != 0  # flat steps add explicit zeros for the previous-step terms

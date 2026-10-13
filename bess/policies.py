@@ -178,12 +178,16 @@ class PerfectForesight:
         actual_rrp: pd.Series,
         start: pd.Timestamp,
         end: pd.Timestamp,
+        terminal_value: tuple[np.ndarray, np.ndarray] | None = None,
     ):
+        """`terminal_value`: (energy grid, value) of energy left at `end`
+        (bess.terminal.end_value), so the plan holds energy worth keeping."""
         prices = actual_rrp.loc[start + INTERVAL : end]
         dt = np.full(len(prices), INTERVAL / HOUR)
         b = config.battery
         c, d, _ = solve_schedule(
-            prices.to_numpy(), dt, b, b.e_initial, config.terminal, config.mip_rel_gap, **dynamics(config, 0.0)
+            prices.to_numpy(), dt, b, b.e_initial, config.terminal, config.mip_rel_gap, **dynamics(config, 0.0),
+            terminal_value=terminal_value,
         )
         self.schedule = pd.Series(d - c, index=prices.index)
         self.config = config

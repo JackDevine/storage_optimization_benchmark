@@ -1,21 +1,30 @@
 """Dev / holdout split for agent experiments.
 
-Split by time so nothing from the holdout period leaks into development: the
-agent develops on October 2021 to August 2025 and is scored on the twelve
-months after, all regions. Windows are (start, end]: intervals ending after
-`start` up to and including `end`, with decisions made at `interval_end - 5min`.
+The data runs from January 2023 to August 2026 (2022 is left out: the energy
+crisis, administered pricing and the market suspension made it unlike any
+other year). Twelve whole calendar months inside that period are the holdout,
+one of each calendar month, three in each year, drawn with a fixed seed, so
+dev and holdout come from the same mix of years and seasons. Everything else
+is dev, less a buffer of BUFFER_DAYS either side of each holdout month: a
+predispatch run looks about 40 hours ahead, and prices and spike events run
+on for days, so the buffer keeps dev data from describing the holdout.
 
-The data starts at 5-minute settlement (1 October 2021). The June 2022 market
-suspension is excluded: prices then came from AEMO's suspension schedule, not
-from bids. Long periods are scored as one window per calendar month, each
-starting the battery afresh, so jobs stay short and run in parallel.
+Windows are (start, end]: intervals ending after `start` up to and including
+`end`, with decisions made at `interval_end - 5min`. Long periods are scored
+as one window per calendar month (or the dev part of one), each starting the
+battery afresh, so jobs stay short and run in parallel.
 
-The dev database holds only data published by the last dev decision time:
-actual prices for intervals ending by DEV_END, and forecast runs available by
-DEV_END - 5min. (Those runs forecast into the holdout; a real participant would
-have them.)
+The dev database (export_dev_db) holds actual prices and forecast runs from
+the dev periods only: no interval in a holdout month or its buffers, and no
+forecast run published in one.
+
+Episodes (7 days, from a trading-day boundary) are drawn once by
+harness/make_episodes.py and frozen: dev episodes in harness/dev_episodes.json
+(the agent's dev_eval default), holdout episodes in data/holdout_episodes.json
+(outside the agent's sandbox).
 """
 
+import json
 from pathlib import Path
 
 import duckdb
@@ -26,37 +35,47 @@ from bess.data import DB_PATH, INTERVAL
 from bess.normalise import PRICE_MAP
 
 REGIONS = ["NSW1", "QLD1", "SA1", "TAS1", "VIC1"]
+ROOT = Path(__file__).resolve().parent.parent
 
-# First decision needs a predispatch run, which starts at 04:01 on 1 October 2021.
-DEV_START = pd.Timestamp("2021-10-01 04:05")
-DEV_END = pd.Timestamp("2025-09-01 00:00")
-HOLDOUT_START = DEV_END
-HOLDOUT_END = pd.Timestamp("2026-09-01 00:00")
+DEV_START = pd.Timestamp("2023-01-01 04:05")  # first decision: needs that morning's 04:01 predispatch run
+DEV_END = pd.Timestamp("2026-09-01 00:00")
+HOLDOUT_START, HOLDOUT_END = DEV_START, DEV_END  # the holdout months lie inside the same period
+BUFFER_DAYS = 3
+HOLDOUT_SEED = 2026
+YEARS = [2023, 2024, 2025, 2026]
 
-# Periods left out of scoring and episodes:
-# - trading days 12-23 June 2022: administered pricing from 12 June, then the
-#   market suspension (15-24 June)
-# - October 2022: AEMO's archive has no predispatch runs for it (only each
-#   period's final forecast, which would leak), so there's no forecast to bid on
-EXCLUDED = [
-    (pd.Timestamp("2022-06-12 04:00"), pd.Timestamp("2022-06-24 04:00")),
-    (pd.Timestamp("2022-10-01 00:00"), pd.Timestamp("2022-11-01 04:05")),  # first November run 04:01
-]
-
-# Submissions are scored on short episodes sampled from a window rather than
-# the whole window: every (region, episode) runs in parallel, so a submission
-# takes about one episode's simulated time. One episode per block: a calendar
-# month in the holdout, four months in dev, so both cover every season.
-EPISODE_DAYS = 3
-DEV_EPISODE_BLOCK_MONTHS = 4
-EPISODE_SEED = 2026
+EPISODE_DAYS = 7
 TRADING_DAY_START = pd.Timedelta(hours=4)
+DEV_EPISODES_PATH = Path(__file__).resolve().parent / "dev_episodes.json"
+HOLDOUT_EPISODES_PATH = ROOT / "data" / "holdout_episodes.json"
 
 Window = tuple[pd.Timestamp, pd.Timestamp]
 
+
+def holdout_months(seed: int = HOLDOUT_SEED) -> list[Window]:
+    """One of each calendar month, three per year, by a seeded shuffle (2026
+    has only January to August)."""
+    rng = np.random.default_rng(seed)
+    while True:
+        years = rng.permutation(np.repeat(YEARS, 3))
+        if all(y < 2026 or m <= 8 for m, y in zip(range(1, 13), years)):
+            break
+    out = []
+    for m, y in zip(range(1, 13), years):
+        a = pd.Timestamp(year=int(y), month=m, day=1)
+        out.append((a, a + pd.offsets.MonthBegin(1)))
+    return sorted(out)
+
+
+HOLDOUT_MONTHS = holdout_months()
+BUFFER = pd.Timedelta(days=BUFFER_DAYS)
+# Dev leaves out each holdout month and its buffers.
+EXCLUDED = [(a - BUFFER, b + BUFFER) for a, b in HOLDOUT_MONTHS]
+
 # Identifies the data behind a score (part of the config fingerprint): bump the
 # number when the data or how it's built changes.
-DATA_VERSION = f"3:{DEV_START}:{HOLDOUT_END}:knee={PRICE_MAP.knee:g},gamma={PRICE_MAP.gamma:g}"
+DATA_VERSION = (f"4:{DEV_START}:{DEV_END}:holdout={HOLDOUT_SEED},buffer={BUFFER_DAYS}d:"
+                f"knee={PRICE_MAP.knee:g},gamma={PRICE_MAP.gamma:g}:forecast-cap=target")
 
 
 def _overlaps(a: Window, b: Window) -> bool:
@@ -64,16 +83,15 @@ def _overlaps(a: Window, b: Window) -> bool:
 
 
 def excluded_overlap(start: pd.Timestamp, end: pd.Timestamp) -> bool:
+    """Does (start, end] touch a holdout month or its buffers?"""
     return any(_overlaps((start, end), x) for x in EXCLUDED)
 
 
-def month_windows(start: pd.Timestamp, end: pd.Timestamp, months: int = 1) -> list[Window]:
-    """(start, end] cut at calendar-month boundaries (every `months` months
-    from January), with the excluded periods cut out."""
-    edges = [start, *[t for t in pd.date_range(start.normalize(), end, freq="MS") if start < t < end
-                      and (t.month - 1) % months == 0], end]
+def month_windows(start: pd.Timestamp, end: pd.Timestamp, excluded: list[Window] = ()) -> list[Window]:
+    """(start, end] cut at calendar-month boundaries, with `excluded` cut out."""
+    edges = [start, *[t for t in pd.date_range(start.normalize(), end, freq="MS") if start < t < end], end]
     windows = list(zip(edges[:-1], edges[1:]))
-    for x0, x1 in EXCLUDED:
+    for x0, x1 in excluded:
         out = []
         for a, b in windows:
             if not _overlaps((a, b), (x0, x1)):
@@ -84,61 +102,46 @@ def month_windows(start: pd.Timestamp, end: pd.Timestamp, months: int = 1) -> li
             if x1 < b:
                 out.append((x1, b))
         windows = out
-    return windows
+    return [(a, b) for a, b in windows if b - a >= pd.Timedelta(days=1)]
 
 
-def sample_episodes(blocks: list[Window], days: int = EPISODE_DAYS, seed: int = EPISODE_SEED) -> list[Window]:
-    """Seeded sample of whole-trading-day episodes (D 04:00, D+days 04:00], one
-    inside each block that can hold one. Deterministic for given blocks and
-    seed, so episodes follow the split automatically if the data changes.
-
-    Each episode starts at a trading-day boundary, so the battery starts at its
-    initial SOC with a fresh daily price lock.
-    """
-    rng = np.random.default_rng(seed)
-    length = pd.Timedelta(days=days)
-    episodes = []
-    for start, end in blocks:
-        first = (start - TRADING_DAY_START).ceil("D") + TRADING_DAY_START  # first trading-day start >= start
-        candidates = [d for d in pd.date_range(first, end - length, freq="D") if not excluded_overlap(d, d + length)]
-        if candidates:
-            d = candidates[rng.integers(len(candidates))]
-            episodes.append((d, d + length))
-    return episodes
+DEV_MONTHS = month_windows(DEV_START, DEV_END, EXCLUDED)
 
 
-HOLDOUT_MONTHS = month_windows(HOLDOUT_START, HOLDOUT_END)
-DEV_MONTHS = month_windows(DEV_START, DEV_END)
-HOLDOUT_EPISODES = sample_episodes(HOLDOUT_MONTHS)
-DEV_EPISODES = sample_episodes(month_windows(DEV_START, DEV_END, DEV_EPISODE_BLOCK_MONTHS))
+def _load_episodes(path: Path) -> list[Window]:
+    """Frozen episodes, or none if the file isn't there (the holdout file isn't
+    visible inside the agent's sandbox)."""
+    try:
+        return [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in json.loads(path.read_text())["episodes"]]
+    except (FileNotFoundError, PermissionError):
+        return []
+
+
+DEV_EPISODES = _load_episodes(DEV_EPISODES_PATH)
+HOLDOUT_EPISODES = _load_episodes(HOLDOUT_EPISODES_PATH)
 
 
 def export_dev_db(dest: Path, source: Path = DB_PATH) -> None:
-    """Write the dev-period subset of the tables the simulator reads."""
+    """Write the dev periods of the tables the simulator reads: actual prices
+    for intervals in a dev period, forecast runs published in one (a run made
+    in dev time can look into a buffer, never into a holdout month)."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.unlink(missing_ok=True)
-    last_decision = DEV_END - INTERVAL
+    first = DEV_START - pd.Timedelta(days=1)  # the first decisions' forecast runs and some price history
+    zones = " AND ".join(f"NOT (t > TIMESTAMP '{a}' AND t <= TIMESTAMP '{b}')" for a, b in EXCLUDED)
     con = duckdb.connect(str(dest))
     try:
         con.execute(f"ATTACH '{source}' AS src (READ_ONLY)")
-        con.execute(
-            """CREATE TABLE dispatchprice AS
-               SELECT * FROM src.dispatchprice WHERE SETTLEMENTDATE <= ? ORDER BY REGIONID, SETTLEMENTDATE""",
-            [DEV_END],
-        )
-        con.execute(
-            """CREATE TABLE p5min_regionsolution AS
-               SELECT * FROM src.p5min_regionsolution WHERE RUN_DATETIME <= ?
-               ORDER BY REGIONID, RUN_DATETIME, INTERVAL_DATETIME""",
-            [last_decision],
-        )
-        con.execute(
-            """CREATE TABLE predispatchprice AS
-               SELECT * FROM src.predispatchprice WHERE LASTCHANGED <= ?
-               ORDER BY REGIONID, LASTCHANGED, DATETIME""",
-            [last_decision],
-        )
+        for table, t, order in (
+            ("dispatchprice", "SETTLEMENTDATE", "REGIONID, SETTLEMENTDATE"),
+            ("p5min_regionsolution", f"RUN_DATETIME - INTERVAL {int(INTERVAL.total_seconds())} SECOND",
+             "REGIONID, RUN_DATETIME, INTERVAL_DATETIME"),
+            ("predispatchprice", "LASTCHANGED", "REGIONID, LASTCHANGED, DATETIME"),
+        ):
+            con.execute(f"""CREATE TABLE {table} AS SELECT * EXCLUDE (t) FROM (
+                    SELECT *, {t} AS t FROM src.{table}) WHERE t > ? AND t <= ? AND {zones} ORDER BY {order}""",
+                        [first, DEV_END])
         # The cap's history (it's announced well ahead, so the future entries are public).
         con.execute("CREATE TABLE market_price_thresholds AS SELECT * FROM src.market_price_thresholds")
         con.execute("CREATE TABLE price_map AS SELECT * FROM src.price_map")
