@@ -13,8 +13,10 @@ initial SOC. In every job:
 - value = net revenue + the change in the stored energy's value over the
   window, V(e_end) - V(e_start) (bess/terminal.py; the same V for everyone);
 - the TWAP baseline runs on the same window, and each trading day the policy
-  falls behind it (value per day; the energy-value change counts on the last
-  day) adds to its shortfall;
+  falls behind it adds to its shortfall. A day's value is marked to market:
+  its net revenue plus the change in its stored energy's value (the same V,
+  from the forecast at each 04:00), so energy carried into a later day counts
+  on the day it was bought, and the days add up to the window's value;
 - perfect foresight plans with the same terminal value.
 The score is (sum of value - SHORTFALL_LAMBDA x sum of shortfall) as a
 percentage of perfect foresight's value, pooled over all jobs. Scores at
@@ -223,12 +225,38 @@ def aggregate(jobs: list[dict]) -> dict:
     }
 
 
-def daily_value(intervals: pd.DataFrame, terminal_credit: float) -> pd.Series:
-    """Net revenue per trading day (04:00 to 04:00), the energy-value change on the last day."""
+def day_ends(intervals: pd.DataFrame, end: pd.Timestamp) -> pd.Series:
+    """Each interval's trading day (04:00 to 04:00), labelled by when that day ends in the window."""
     day = (intervals.interval_end - pd.Timedelta(minutes=5) - pd.Timedelta(hours=4)).dt.floor("D")
-    daily = (intervals.revenue - intervals.degradation_cost).groupby(day).sum()
-    daily.iloc[-1] += terminal_credit
-    return daily
+    return (day + pd.Timedelta(days=1, hours=4)).clip(upper=end)
+
+
+def daily_value(intervals: pd.DataFrame, values: dict, e0: float, end: pd.Timestamp) -> pd.Series:
+    """Value per trading day, marked to market: the day's net revenue plus the
+    change in its stored energy's value, measured against holding e0
+    (I(t) = V_t(e) - V_t(e0), with I = 0 at the window's start). The days add
+    up to the window's value, net revenue + V_end(e_end) - V_end(e0).
+    `values`: day-end time -> (grid, V) from bess.terminal.end_value."""
+    ends = day_ends(intervals, end)
+    cash = (intervals.revenue - intervals.degradation_cost).groupby(ends).sum()
+    energy = intervals.energy_end_mwh.groupby(ends).last()
+    held = pd.Series([credit(values[t], energy[t], e0) for t in cash.index], index=cash.index)
+    return cash + held.diff().fillna(held)
+
+
+def day_end_values(data, intervals: pd.DataFrame, end: pd.Timestamp, battery) -> dict:
+    """V at each trading-day end in the window, from the forecast known then.
+    If no forecast is available at a day end (archive gaps), the previous day
+    end's valuation stands in."""
+    out, last = {}, None
+    for t in sorted(day_ends(intervals, end).unique()):
+        try:
+            last = end_value(data, t, battery)
+        except ValueError:
+            if last is None:
+                raise
+        out[t] = last
+    return out
 
 
 def _run_region(args) -> dict:
@@ -270,7 +298,8 @@ def _run_region(args) -> dict:
         # (a crash leaves a traceback). Not the policy's fault, so say so.
         return killed
     b = config.battery
-    terminal = end_value(data, end, b)
+    values = day_end_values(data, intervals, end, b)
+    terminal = values[end]
     summary = summarise(intervals, b)
     agent_credit = credit(terminal, float(intervals.energy_end_mwh.iloc[-1]), b.e_initial)
     pf_intervals = simulate(PerfectForesight(config, data.actual_rrp, start, end, terminal), data, config, start, end)
@@ -278,7 +307,8 @@ def _run_region(args) -> dict:
     pf_credit = credit(terminal, float(pf_intervals.energy_end_mwh.iloc[-1]), b.e_initial)
     twap_intervals = simulate(TWAPPolicy(config), data, config, start, end)
     twap_credit = credit(terminal, float(twap_intervals.energy_end_mwh.iloc[-1]), b.e_initial)
-    agent_daily, twap_daily = daily_value(intervals, agent_credit), daily_value(twap_intervals, twap_credit)
+    agent_daily = daily_value(intervals, values, b.e_initial, end)
+    twap_daily = daily_value(twap_intervals, values, b.e_initial, end)
     shortfall = float((twap_daily - agent_daily.reindex(twap_daily.index, fill_value=0.0)).clip(lower=0).sum())
     if out_dir:
         intervals.to_parquet(out_dir / f"{tag}_intervals.parquet")
