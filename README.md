@@ -6,6 +6,12 @@ energy market. The policy is then run on 12 months of market data it never saw, 
 way a real battery does: price-responsive bid curves submitted ahead of each interval, under AEMO's bidding rules,
 using only the forecasts published at the time.
 
+A [dashboard](#the-dashboard-watch-the-agents-bid) replays every run: scrub through any day of the holdout to see the
+prices, the forecasts the policy had, the bids it submitted and how it charged and discharged, next to a
+perfect-foresight operator, along with each submission's code and the agent's own account of what it built.
+
+![The dashboard: GPT-6.1 Sol's policy through the 5 August 2024 price spikes in NSW](docs/figures/dashboard_market.png)
+
 ## Results (benchmark v2, October 2026)
 
 ![Leaderboard](docs/figures/leaderboard.png)
@@ -75,6 +81,40 @@ episode scores and dollar values. It reads the results exported to [`results/v2/
 cost and time, each submission, and the baseline), so it runs without the run directories; `uv run python
 notebooks/headline_data.py` refreshes the export from `runs/`. The notebooks need the `notebooks` dependency group:
 `uv run --group notebooks jupyter lab`.
+
+## The dashboard: watch the agents bid
+
+```
+uv run python -m harness.dashboard        # then open http://127.0.0.1:8050
+```
+
+The dashboard replays every run in `runs/`, and follows runs live while they're going. Pick a run, a region and a
+submission, then scrub through the holdout in 5-minute, hourly or daily steps, or press Play.
+
+**The market view** (top of this page) shows NSW on 5 August 2024, when the price sat near the then $17,500 cap
+twice: from 07:40 to 09:15 and from 17:15 to 19:10 (the dashboard shows prices mapped onto today's $23,200 cap). GPT-6.1 Sol's best policy (65.4% on the holdout) discharges into the
+morning spike, recharges at midday and discharges again through the evening, its state of charge (blue) tracking
+perfect foresight's (grey) closely.
+- **Price panel:** actual prices up to the scrub time; ahead of it, the P5MIN and predispatch forecasts the policy
+  could see at that moment.
+- **Stored energy and dispatch:** the policy's state of charge and MW against perfect foresight.
+- **Bid for the next interval:** the bid the policy actually submitted, drawn as the MW it would dispatch at each price,
+  with its 10 load and 10 generation bands.
+- **Run stats:** active time, cost, tokens, tool calls and scores.
+
+**Compare runs:** every leaderboard run's best feedback-episode score over its two hours. The diamonds are each run's
+final policy on the full holdout.
+
+![The dashboard's run comparison](docs/figures/dashboard_compare.png)
+
+**Submissions and agent activity:** each submission's score and the agent's own summary of the policy. Opening one
+shows its rationale, the reasoning that led up to it, and every file it submitted. Alongside is the run's activity
+feed: tool calls, submissions and results as they happened.
+
+![Submissions and agent activity for GPT-6.1 Sol's best run](docs/figures/dashboard_submissions.png)
+
+The dashboard serves holdout data, on 127.0.0.1 only, so keep it out of the agents' reach (their sandboxes have no
+network). More detail is under *Agent experiments* below.
 
 ## Setup
 
