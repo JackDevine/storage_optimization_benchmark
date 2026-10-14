@@ -1,0 +1,13 @@
+model,slug,effort,index,rep,run_id,full_pct,episodes_pct,cost,billing,active_min,out_tokens,submissions,ended_by
+GPT-6.1 Sol,openai/gpt-6.1-sol,max,52,1,20261013-152939-lb-openai_gpt-6.1-sol-max-r1,65.3611,60.3578,3.37841,openrouter,119.646,134602,9,agent_finished
+Opus 5.5,claude-opus-5-5,max,58,1,20261013-152946-lb-claude-opus-5-5-max-r1,60.118,54.5837,9.10004,subscription,33.6738,139487,10,agent_finished
+MiMo v2.6 Pro,xiaomi/mimo-v2.6-pro,high,46,1,20261013-152948-lb-xiaomi_mimo-v2.6-pro-high-r1,59.5469,54.4796,0.216276,openrouter,98.6834,119084,1,agent_finished
+DeepSeek V4.1 Flash,deepseek/deepseek-v4.1-flash,high,39,1,20261013-152954-lb-deepseek_deepseek-v4.1-flash-high-r1,,,0.168278,openrouter,120.15,77286,0,active_time
+Opus 5.5,claude-opus-5-5,max,58,2,20261013-152955-lb-claude-opus-5-5-max-r2,52.3337,55.682,7.87353,subscription,99.2922,111557,4,agent_finished
+GLM 5.3,z-ai/glm-5.3,low,34,1,20261013-173032-lb-z-ai_glm-5.3-low-r1,43.4863,42.0297,0.520865,openrouter,79.2871,24740,9,agent_finished
+gpt-oss-120b,openai/gpt-oss-120b,high,12,1,20261013-175121-lb-openai_gpt-oss-120b-high-r1,50.5188,38.9282,0.122411,openrouter,52.919,26774,10,agent_finished
+GPT-6.1 Sol,openai/gpt-6.1-sol,max,52,2,20261013-183254-lb-openai_gpt-6.1-sol-max-r2,48.764,57.6191,2.38369,openrouter,117.152,111960,10,agent_finished
+MiMo v2.6 Pro,xiaomi/mimo-v2.6-pro,high,46,2,20261013-195544-lb-xiaomi_mimo-v2.6-pro-high-r2,59.8713,52.2731,0.295925,openrouter,104.692,168769,7,agent_finished
+DeepSeek V4.1 Flash,deepseek/deepseek-v4.1-flash,high,39,2,20261013-204747-lb-deepseek_deepseek-v4.1-flash-high-r2,46.8188,38.115,0.268349,openrouter,81.1807,97226,1,agent_finished
+GLM 5.3,z-ai/glm-5.3,low,34,2,20261013-211253-lb-z-ai_glm-5.3-low-r2,49.7638,41.7785,0.365689,openrouter,105.479,31302,2,agent_finished
+gpt-oss-120b,openai/gpt-oss-120b,high,12,2,20261013-222828-lb-openai_gpt-oss-120b-high-r2,,,0.0105886,openrouter,2.05478,3734,0,max_nudges

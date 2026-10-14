@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 data/
 runs/
+.ipynb_checkpoints/
