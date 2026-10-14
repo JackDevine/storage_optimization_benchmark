@@ -1,6 +1,80 @@
 # Storage Optimization Benchmark
 
-Benchmark data and models for storage optimization against AEMO NEM market data.
+Can an AI agent write a bidding policy for a grid battery? Each model gets a sandboxed workspace, real Australian
+electricity market (NEM) data and two hours to write a policy that bids a 1 MW / 2 MWh battery into the 5-minute
+energy market. The policy is then run on 12 months of market data it never saw, in all five NEM regions, bidding the
+way a real battery does: price-responsive bid curves submitted ahead of each interval, under AEMO's bidding rules,
+using only the forecasts published at the time.
+
+## Results (benchmark v2, October 2026)
+
+![Leaderboard](docs/figures/leaderboard.png)
+
+Six models, two runs each. The score is the final policy on the 12-month holdout as a percentage of what a
+perfect-foresight operator would earn (see *Scoring* below).
+
+| Model (effort) | AA index | Runs | Mean | Feedback episodes | $/MW/yr | Cost per run |
+|---|---|---|---|---|---|---|
+| MiMo v2.6 Pro (high) | 46 | 59.5, 59.9 | **59.7** | 53.4 | $101k | $0.26 |
+| GPT-6.1 Sol (max) | 52 | 65.4, 48.8 | **57.1** | 59.0 | $96k | $2.88 |
+| Opus 5.5 (max) | 58 | 60.1, 52.3 | **56.2** | 55.1 | $95k | $8.49 |
+| gpt-oss-120b (high) | 12 | 50.5, — | **50.5** | 38.9 | $85k | $0.07 |
+| DeepSeek V4.1 Flash (high) | 39 | —, 46.8 | **46.8** | 38.1 | $79k | $0.22 |
+| GLM 5.3 (low) | 34 | 43.5, 49.8 | **46.6** | 41.9 | $79k | $0.44 |
+| *TWAP baseline* | | | *50.7* | *39.1* | *$85k* | |
+
+- **AA index:** the Artificial Analysis Intelligence Index at the effort each model ran at, checked 12–13 October 2026
+  (DeepSeek and GLM aren't listed at exactly our setting).
+- **Mean:** over runs that submitted; — is a run with no submission.
+- **Feedback episodes:** the same final policies on the 12 seven-day episodes the agents got feedback on.
+- **$/MW/yr:** the score's dollar value for one 1 MW battery, averaged over the five regions; perfect foresight is
+  $168k.
+- **Cost per run:** model cost; Opus at API prices (it ran on a subscription).
+
+What stands out:
+
+- **Three models beat the TWAP baseline**, all by building dynamic-programming policies that value stored energy from
+  AEMO's forecasts. The best single run is GPT-6.1 Sol's first, at 65.4%.
+- **MiMo v2.6 Pro has the best mean for about 25 cents a run**, both runs within half a point of each other.
+
+  ![Score against cost](docs/figures/score_vs_cost.png)
+
+- **General capability only partly predicts the result.** Against the Artificial Analysis Intelligence Index the
+  correlation is 0.57 over model means on the holdout (permutation p = 0.12), but 0.80 on the feedback episodes
+  (p = 0.02): smarter models fit the episodes they tune against better, and some of that advantage washes out over the
+  full year.
+
+  ![Score against the Intelligence Index](docs/figures/score_vs_index.png)
+
+- **The feedback set ranks runs only loosely** (Spearman 0.55 over 10 runs). GPT-6.1 Sol's second run looked as good
+  as its first on the episodes and lost 9 points on the holdout.
+
+  ![Feedback episodes against the full holdout](docs/figures/episodes_vs_holdout.png)
+
+- **Runs with no submission:** DeepSeek's first run spent its two hours on long local experiments and was cut off
+  mid-test; gpt-oss's second used up its 30 nudges in two minutes without working on the task.
+
+![Best submission so far over each run](docs/figures/progress.png)
+
+Caveats:
+
+- **Two runs per model.** Spreads between a model's runs are often as large as the gaps between models, so read the
+  ranking as indicative.
+- **A price-taking battery.** The simulated battery earns the full market price, which is realistic for one small
+  battery but not for a fleet: in scarcity intervals a few hundred MW of extra supply can collapse the price. The
+  benchmark's dollar figures are therefore an upper bound: on actual (unmapped) prices the TWAP baseline's gross
+  trading revenue was 2.2× what the real NEM battery fleet earned from energy in the same months (1.4× counting the
+  fleet's FCAS revenue). Rankings between policies are unaffected, since every policy faces the same prices.
+  [`notebooks/price_elasticity.ipynb`](notebooks/price_elasticity.ipynb) measures this with AEMO's own price
+  sensitivities: a 100–200 MW fleet running the TWAP baseline's dispatch would earn about 35% less on the mainland.
+- **Prices are mapped onto today's market price cap** (see *Pulling data*), which raises spike prices in earlier
+  years.
+
+The figures come from [`notebooks/headline_figures.ipynb`](notebooks/headline_figures.ipynb), which can also show
+episode scores and dollar values. It reads the results exported to [`results/v2/`](results/v2/) (each run's scores,
+cost and time, each submission, and the baseline), so it runs without the run directories; `uv run python
+notebooks/headline_data.py` refreshes the export from `runs/`. The notebooks need the `notebooks` dependency group:
+`uv run --group notebooks jupyter lab`.
 
 ## Setup
 
@@ -37,6 +111,10 @@ uv run python scripts/price_cap_analysis.py # optional: the analysis behind the 
   compares this with other maps.
 
 None of `data/` is committed (see `.gitignore`).
+
+Market data: Australian Energy Market Operator (AEMO), from its NEMweb MMSDM archive (nemweb.com.au), used under
+AEMO's copyright permissions (aemo.com.au, *Privacy and legal notices*). This repository doesn't redistribute
+it; `scripts/pull_data.py` downloads it from AEMO.
 
 ## Dispatch benchmark
 
@@ -119,37 +197,10 @@ by (config, policy, region), where config is the config file's name.
       band prices it rounds towards doing less, so it never dispatches more than the MILP wanted at that price.
   - `perfect_foresight`: the same MILP solved once over actual prices. It's the ceiling that
     `pct_of_perfect` is measured against.
-- `bess/static_bid.py`: the static bid baselines, which use no forecasts at all. *Parked:* their parameters were
-  fitted to the old two-month split, so they aren't scored as baselines until they're refitted.
-  - **The bid:** 10 load bands and 10 gen bands with prices fixed for all time. Every load price is below every
-    gen price, so the bid is always convex and never charges and discharges at once.
-  - **Three variants**, by what the band MW may depend on:
-    - `static_bid`: nothing (40 numbers per region).
-    - `static_bid_tod`: the time of day, in 30-minute blocks.
-    - `static_bid_tod_soc`: the time of day and the state of charge, in 3 bins.
-  - **MaxAvail** is the only thing that changes otherwise. Each side's is the largest end-of-interval MW from which
-    the unit can still ramp back to 0 at its own rate without leaving its SOC limits. With straight-line dispatch,
-    ending an interval at x MW means x·dt/2 more next interval, so this matters. It's closed-form, and it means
-    whatever clears is deliverable, so the policy never causes non-conformance.
-  - **Fitting:** `scripts/fit_static_bids.py` fits one bid per region to dev prices with CMA-ES, on a fast
-    vectorised simulator for these bids. `scripts/check_static_bid_parity.py` checks that simulator against
-    `bess/sim.py`. The fit is a one-off, and `cma` isn't a project dependency: run it with
-    `uv run --with cma==4.5.0 python scripts/fit_static_bids.py --validate`. The fitted parameters live in
-    `harness/static_bid_policies/<variant>/params.json`, next to a `policy.py` in the submission format.
-  - **Scoring:** `harness.evaluator reference` scores them with the MILP baseline on every reference set. A
-    refit is re-scored automatically, keyed by a hash of its parameters. Submission feedback, `summary.json` and
-    the dashboard report them alongside the MILP baseline. They're fitted to dev prices, so their dev scores are
-    in-sample; the brief says so.
-  - **Results** (% of perfect foresight; MILP baseline: dev 26.3, holdout episodes 33.3, full month 38.3):
-
-    | Variant | June fit → July | Dev (in-sample) | Holdout episodes | Full month | Fit time |
-    |---|---|---|---|---|---|
-    | `static_bid` | 63.6 → 27.7 | 51.5 | 20.1 | 19.7 | 18 min |
-    | `static_bid_tod` | 73.0 → 31.6 | 60.2 | 25.6 | 24.3 | 34 min |
-    | `static_bid_tod_soc` | 73.1 → 30.8 | 60.3 | 25.8 | 24.4 | 40 min |
-
-    They overfit badly, mostly to a few SA1 cap-price spikes (SA1 is negative on the holdout). The SOC bins add
-    nothing; the time-of-day blocks add about 5 points out of sample.
+- `bess/static_bid.py`: static bid baselines, fixed bid curves that use no forecasts (`static_bid`, plus
+  time-of-day and state-of-charge variants), fitted to dev prices with CMA-ES by `scripts/fit_static_bids.py`.
+  *Parked:* they were fitted to an earlier split and overfit badly to a few SA cap-price spikes, so they aren't
+  scored as baselines until they're refitted.
 
 ## Agent experiments
 
@@ -160,7 +211,12 @@ uv run python -m harness.run_agent --model claude-sonnet-5-5 --max-hours 2 --max
 uv run python -m harness.run_agent --model openai/gpt-5.1 --max-hours 2 --max-cost 20   # any OpenRouter slug
 uv run python -m harness.dashboard                 # live view at http://127.0.0.1:8050
 MODELS="claude-opus-5-5 google/gemini-3-pro" scripts/run_sweep.sh   # several models, one after another
+CLAUDE_JOBS="claude-opus-5-5 1 --effort max" OPENROUTER_JOBS="z-ai/glm-5.3 1 --effort low" \
+  scripts/run_leaderboard.sh                       # the leaderboard: 2 h, 10 submissions per run, queued
 ```
+
+The leaderboard runs above used `scripts/run_leaderboard.sh` (2 hours of active time, up to 10 submissions, a $20
+cap for OpenRouter models, gpt-oss with `--max-nudges 30`); `run_agent.py` on its own defaults to 5 submissions.
 
 A model is asked to write a bidding policy. There are two backends, picked by the model name:
 
@@ -181,33 +237,45 @@ A model is asked to write a bidding policy. There are two backends, picked by th
     back unmodified on later calls.
   - When the prompt nears the model's context window, the oldest tool outputs are elided.
 
-- **Split** (`harness/splits.py`): the agent develops on October 2021 – August 2025 (`data/dev.duckdb`, with only
-  what was published by the end of August 2025). It's scored on September 2025 – August 2026, all five regions.
-  Prices are mapped onto today's cap (see *Pulling data*).
-  - **Excluded:** the June 2022 market suspension (trading days 12–23 June) and October 2022, which has no
-    predispatch runs in AEMO's archive.
-  - **Monthly windows:** long periods are scored one calendar month at a time (`month_windows`), each starting
-    the battery at 50%, so every (region, month) is a short parallel job and perfect foresight stays a
-    month-sized MILP. The dev reference set is every dev month; the full holdout is every holdout month.
-- **Reference scores** (config `ee2a85469681`: $30/MWh wear; % of perfect foresight):
-
-  | Set | `twap` (headline) | `lp_forecast` |
-  |---|---|---|
-  | Every dev month (235 region-months) | 46.3 | 52.8 |
-  | Dev episodes (`dev_eval` default) | 36.7 | 29.4 |
-  | Holdout episodes (submissions) | 38.1 | 40.5 |
-  | Full holdout (final score) | 32.4 | 27.3 |
-
-  On this laptop, scoring TWAP takes 24 s for a submission, 28 s for `dev_eval`'s default episodes, 2.5 min for the
-  full holdout and 9 min for every dev month (the LP about 1.5–2× that). The evaluator runs as many jobs in parallel
-  as both the CPUs and the free memory allow (about 1.2 GB per job, allowing for a torch policy).
-- **Episodes:** submissions are scored on a seeded sample of 3-day episodes (`sample_episodes`), one per holdout
-  month (12), each starting at 04:00 with the battery at 50%. All region × episode jobs run in parallel, so a
-  submission takes about one episode's simulated time.
+- **Split** (`harness/splits.py`): the data runs from January 2023 to August 2026. 2022 is left out: the energy
+  crisis, administered pricing and the June market suspension made it unlike any other year. Twelve whole calendar
+  months are the **holdout**, one of each calendar month and three in each year, drawn with a fixed seed: January,
+  February and December 2023; May, August and September 2024; July, October and November 2025; March, April and
+  June 2026. Everything else is **dev**, less a 3-day buffer either side of each holdout month (a predispatch run
+  looks about 40 hours ahead, and spike events run on for days). `data/dev.duckdb` holds only dev prices and
+  forecast runs published in dev periods. Prices are mapped onto today's cap (see *Pulling data*).
+  - **Monthly windows:** long periods are scored one calendar month at a time, each starting the battery at 50%, so
+    every (region, month) is a short parallel job and perfect foresight stays a month-sized problem. The dev
+    reference set is every dev month; the full holdout is every holdout month.
+- **Episodes:** 7-day windows from a trading-day boundary (04:00), drawn once by `harness/make_episodes.py` and
+  frozen. Submissions are scored on 12 holdout episodes, one per holdout month (`data/holdout_episodes.json`,
+  outside the agent's sandbox), in all five regions in parallel. `dev_eval` defaults to 6 dev episodes
+  (`harness/dev_episodes.json`); `--full` scores every dev month.
   - After the run ends, the final valid submission is also scored on the **full holdout**, month by month
     (`summary.json` → `final_full_holdout_pct_of_perfect`). That's the headline result.
-  - `dev_eval` (no arguments) uses the same sampling over the dev period, one episode per four months (14).
-    `--full` scores every dev month.
+- **Scoring** (`harness/evaluator.py`), for each region and window:
+  - **Value** = net revenue (after wear) + the change in the stored energy's value over the window, V(e_end) −
+    V(e_start). V comes from a dynamic program over the forecast at the window's end (`bess/terminal.py`) and is the
+    same for every policy, so there's no point emptying the battery before an end the policy can't see.
+  - **Shortfall:** TWAP runs on the same window; on each trading day where the policy's value is below TWAP's, the
+    difference is that day's shortfall. Each day is marked to market (net revenue plus the change in its stored
+    energy's value, from the forecast at each 04:00), so energy carried into a later day counts on the day it was
+    bought.
+  - **Score** = (total value − 0.5 × total shortfall) as a percentage of perfect foresight's value, pooled over all
+    jobs. Perfect foresight plans with the same terminal value. Scores with shortfall weights 0 and 1, and with equal
+    weight per window, are reported alongside.
+- **Reference scores** (config `cbc1b423dc13`: $30/MWh wear; % of perfect foresight):
+
+  | Set | `twap` (headline baseline) | `lp_forecast` |
+  |---|---|---|
+  | Every dev month | 44.3 | 43.3 |
+  | Dev episodes (`dev_eval` default) | 41.2 | 48.6 |
+  | Holdout episodes (submissions) | 39.1 | 27.6 |
+  | Full holdout (final score) | 50.7 | 42.8 |
+
+  On this laptop, scoring TWAP takes about 1 minute for a submission, 4 minutes for the full holdout and 12 minutes
+  for every dev month. The evaluator runs as many jobs in parallel as both the CPUs and the free memory allow (about
+  1 GB per job, keeping 4 GB spare).
 - **Task** (`harness/task.md`, copied into the workspace as `TASK.md`): write `policy.py` with
   `Policy(config, region).decide(obs) -> BDUBid`. `obs` is a `bess.observation.Observation` holding the latest
   P5MIN and predispatch runs, past actual prices and the battery state.
@@ -256,3 +324,7 @@ A model is asked to write a bidding policy. There are two backends, picked by th
   - Each submission shows the agent's summary and rationale, its reasoning leading up to it, and the code.
   - URL parameters: `?region=VIC1&tau=2026-02-12T08:30&run=<id>`.
   - It serves holdout data on 127.0.0.1, so keep it out of the agent's reach. The agent's bash has no network.
+
+## Licence
+
+The code is released under the [MIT licence](LICENSE). AEMO's market data is AEMO's (see *Pulling data*).
