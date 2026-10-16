@@ -37,6 +37,30 @@ perfect-foresight operator would earn (see *Scoring* below).
   $168k.
 - **Cost per run:** model cost; Opus at API prices (it ran on a subscription).
 
+### Episode scores and full-holdout scores
+
+Each agent's submissions were scored on 12 one-week evaluation episodes
+(one per holdout month) during the run, and the agents could see those
+scores. Each agent's final submission was then scored on the full
+12-month holdout, which the agents never saw. Both are reported below
+for the top three models (mean of two runs).
+
+| Policy            | Episode score ($/MW/yr) | Full holdout ($/MW/yr) |
+|-------------------|------------------------:|-----------------------:|
+| GPT-6.1 Sol       | 90k                     | 96k                    |
+| Opus 5.5          | 84k                     | 95k                    |
+| MiMo v2.6 Pro     | 82k                     | 101k                   |
+| TWAP baseline     | 60k                     | 85k                    |
+| Perfect foresight | 153k                    | 168k                   |
+
+The episode score measures how well an agent optimises against a fixed
+target it gets feedback on. The full holdout score measures how well
+that policy generalises. The ranking changes between the two, so tuning
+to a small feedback set is a real source of overfitting here. The two
+columns cover different weeks, so compare rankings, not dollar values,
+across them: every policy earns more on the full holdout, perfect
+foresight included.
+
 What stands out:
 
 - **Three models beat the TWAP baseline**, all by building dynamic-programming policies that value stored energy from
